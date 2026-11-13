@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Viewer · Low Poly</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  body { --ink: #fff; --edge: #1a3a8a; --panel: rgba(10, 30, 90, 0.45); }
+  body[data-env="room"] { --ink: #fff; --edge: #55555f; --panel: rgba(40, 40, 50, 0.6); }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
+    font: bold 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    letter-spacing: 0.12em; color: var(--ink); text-shadow: 1px 1px 0 var(--edge);
+    pointer-events: none; transition: opacity 2s;
+  }
+  body[data-env="room"] #hint { color: #55555f; text-shadow: none; }
+  #hint.error { color: #fff; background: #b3261e; text-shadow: none; padding: 6px 0; }
+  .bar { position: fixed; top: 14px; display: flex; gap: 8px; }
+  #left { left: 14px; } #right { right: 14px; }
+  .bar button, .bar select {
+    padding: 6px 10px; margin: 0;
+    font: bold 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 0.1em;
+    color: var(--ink); background: var(--panel); border: 1px solid var(--ink); border-radius: 3px;
+    opacity: 0.7; cursor: pointer;
+  }
+  .bar option { color: #000; background: #fff; }
+  .bar button:hover, .bar button:focus-visible, .bar select:hover, .bar select:focus-visible { opacity: 1; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div class="bar" id="left"><select id="model" aria-label="Model"></select></div>
+<div class="bar" id="right">
+  <button id="env" type="button">BG: outdoors</button>
+  <button id="spin" type="button" aria-pressed="false">SPIN: off</button>
+  <button id="crt" type="button" aria-pressed="true">CRT: on</button>
+</div>
+<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · S spin · R reset view</div>
+<script type="module">
+// Viewing environment for models built with the low-poly renderer from index.html.
+//
+// To add a model: write models/<name>.js (see models/cherry-tree.js for the shape of
+// one) and add <name> to MODEL_FILES below. It then shows up in the picker, and can be
+// opened directly with viewer.html?model=<name>. Other URL options: ?env=room or
+// ?env=outdoors, ?crt=off, ?spin=on, ?seed=12.
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---------------------------------------------------------------- settings
+const MODEL_FILES = ['cherry-tree', 'cat'];
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get('seed')) || 3;
+const RENDER_HEIGHT = 300;      // internal resolution in pixels; lower = chunkier
+const SUN_DIR = new THREE.Vector3(-0.45, 0.42, -0.8).normalize();
+const WIND_DIR = new THREE.Vector3(1, 0, 0.35).normalize();
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = reducedMotion ? 0.35 : 1;
+const remember = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+const recall = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+
+// ------------------------------------------------------------- seeded RNG
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(SEED);                 // for the backdrop; each model gets its own stream
+const rr = (a, b) => a + (b - a) * rand();
+const pick = (list) => list[(rand() * list.length) | 0];
+
+// ------------------------------------------------------------ scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 1200);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0xd8b8c4, 2.6);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff6e0, 2.0);
+sun.position.copy(SUN_DIR).multiplyScalar(50);
+scene.add(sun);
+
+// --------------------------------------------------------- pixel textures
+function canvasTexture(w, h, paint, { pixelated = true, mipmaps = false } = {}) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  paint(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.magFilter = pixelated ? THREE.NearestFilter : THREE.LinearFilter;
+  t.minFilter = mipmaps ? THREE.LinearMipmapLinearFilter : (pixelated ? THREE.NearestFilter : THREE.LinearFilter);
+  t.generateMipmaps = mipmaps;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+const GRASS_SIZE = 64;
+const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
+  const G = 8, grid = Array.from({ length: G * G }, () => rand());
+  const patch = (x, y) => {                    // smooth noise that repeats every w pixels
+    const fx = (x / w) * G, fy = (y / h) * G, x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const u = fx - x0, v = fy - y0, at = (i, j) => grid[((j + G) % G) * G + ((i + G) % G)];
+    const L = THREE.MathUtils.lerp;
+    return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
+  };
+  const greens = ['#2c8f22', '#3aa628', '#4dbb2e', '#62cc36', '#7cdc40'];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const n = patch(x, y) + rr(-0.16, 0.16);
+    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    ctx.fillRect(x, y, 1, 1);
+  }
+  const blades = ['#9be84c', '#b4f060', '#84de42', '#247c1c', '#1f6e1a'];
+  for (let i = 0; i < 520; i++) {
+    let x = (rand() * w) | 0, y = (rand() * h) | 0;
+    const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
+    ctx.fillStyle = pick(blades);
+    for (let k = 0; k < len; k++) {
+      ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
+      y -= 1; if (k % 2 === 1) x += lean;
+    }
+  }
+}, { mipmaps: true });
+
+// sky: blue gradient with wispy clouds, painted once from layered noise
+function hash3(x, y, z) {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2147483647) ^ (SEED * 9781);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise3(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const s = (t) => t * t * (3 - 2 * t);
+  const u = s(x - xi), v = s(y - yi), w = s(z - zi);
+  const L = THREE.MathUtils.lerp;
+  const at = (a, b, c) => hash3(xi + a, yi + b, zi + c);
+  return L(
+    L(L(at(0, 0, 0), at(1, 0, 0), u), L(at(0, 1, 0), at(1, 1, 0), u), v),
+    L(L(at(0, 0, 1), at(1, 0, 1), u), L(at(0, 1, 1), at(1, 1, 1), u), v), w);
+}
+const skyTex = canvasTexture(512, 256, (ctx, w, h) => {
+  const img = ctx.createImageData(w, h);
+  const top = [10, 62, 214], low = [96, 170, 255];
+  for (let y = 0; y < h; y++) {
+    const up = Math.max(0, 1 - y / (h / 2));           // 1 at the zenith, 0 at the horizon and below
+    for (let x = 0; x < w; x++) {
+      const a = (x / w) * Math.PI * 2;                 // sampled around a circle so the seam matches
+      let n = 0, amp = 0.5, f = 1;
+      for (let o = 0; o < 5; o++) {
+        n += amp * noise3(Math.cos(a) * 2.2 * f, Math.sin(a) * 2.2 * f, (y / h) * 9 * f + o * 7.3);
+        amp *= 0.5; f *= 2;
+      }
+      const cloud = THREE.MathUtils.smoothstep(n, 0.4, 0.62) * THREE.MathUtils.smoothstep(up, 0.02, 0.3);
+      const g = Math.pow(up, 0.7);
+      const i = (y * w + x) * 4;
+      for (let k = 0; k < 3; k++) img.data[i + k] = THREE.MathUtils.lerp(THREE.MathUtils.lerp(low[k], top[k], g), 255, cloud);
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}, { pixelated: false });
+skyTex.wrapT = THREE.ClampToEdgeWrapping;
+
+// ------------------------------------------------ PS1-style vertex shader
+// Every material gets vertex snapping (the wobble of old consoles); the tree
+// also gets wind, from one function so bark and blossom move together.
+const shared = { uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) } };
+const PSX_GLSL = /* glsl */`
+  uniform float uTime;
+  uniform float uWind;
+  uniform vec2 uSnap;
+  vec3 windOffset(vec3 p) {
+    float flex = smoothstep(2.2, 9.0, p.y) * 0.75 + 0.03 * length(p.xz);
+    float gust = 0.3
+      + 0.6 * sin(uTime * 0.9 + p.x * 0.35 + p.z * 0.25)
+      + 0.25 * sin(uTime * 2.3 + p.x * 1.3 + p.y * 0.9);
+    vec3 dir = normalize(vec3(1.0, 0.0, 0.35));
+    vec3 o = dir * flex * gust * 0.3;
+    o.y += sin(uTime * 3.1 + p.x * 2.0 + p.z * 2.0) * 0.03 * flex;
+    return o * uWind;
+  }
+`;
+const PSX_PROJECT_GLSL = /* glsl */`
+  vec4 wPos = vec4(transformed, 1.0);
+  #ifdef USE_INSTANCING
+    wPos = instanceMatrix * wPos;
+  #endif
+  wPos = modelMatrix * wPos;
+  wPos.xyz += windOffset(wPos.xyz);
+  vec4 mvPosition = viewMatrix * wPos;
+  gl_Position = projectionMatrix * mvPosition;
+  gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;
+`;
+function psx(material, windAmount = 0) {
+  const uWind = { value: windAmount * MOTION };
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = shared.uTime;
+    shader.uniforms.uSnap = shared.uSnap;
+    shader.uniforms.uWind = uWind;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + PSX_GLSL)
+      .replace('#include <project_vertex>', PSX_PROJECT_GLSL);
+  };
+  material.customProgramCacheKey = () => 'psx';
+  return material;
+}
+
+// ------------------------------------------------------------ backdrops
+// outdoors: the sky, grass and sun from index.html
+const outdoors = new THREE.Group();
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(900, 24, 12),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, depthWrite: false, fog: false })
+);
+sky.renderOrder = -1;
+outdoors.add(sky);
+
+const GROUND_R = 600, TEXEL = 0.1;             // world size of one grass pixel
+grassTex.repeat.setScalar((GROUND_R * 2) / (GRASS_SIZE * TEXEL));
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(GROUND_R, 24),
+  new THREE.MeshLambertMaterial({ map: grassTex })
+);
+ground.rotation.x = -Math.PI / 2;
+outdoors.add(ground);
+
+{
+  const glow = canvasTexture(64, 64, (ctx) => {
+    const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.25, 'rgba(255,250,220,0.7)'); g.addColorStop(1, 'rgba(255,240,200,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+  }, { pixelated: false });
+  const hexagon = canvasTexture(64, 64, (ctx) => {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) ctx.lineTo(32 + 29 * Math.cos((i * Math.PI) / 3), 32 + 29 * Math.sin((i * Math.PI) / 3));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fill();
+  }, { pixelated: false });
+  const flare = new Lensflare();
+  flare.position.copy(SUN_DIR).multiplyScalar(800);
+  flare.addElement(new LensflareElement(glow, 80, 0, new THREE.Color(0xffffff)));
+  flare.addElement(new LensflareElement(hexagon, 26, 0.3, new THREE.Color(0x9a8cff)));
+  flare.addElement(new LensflareElement(hexagon, 46, 0.5, new THREE.Color(0x7f9dff)));
+  flare.addElement(new LensflareElement(hexagon, 34, 0.75, new THREE.Color(0x8fe0b0)));
+  flare.addElement(new LensflareElement(hexagon, 22, 1.0, new THREE.Color(0xb0c8ff)));
+  outdoors.add(flare);
+}
+scene.add(outdoors);
+
+// white room: a box seen from the inside, each surface a slightly different white so
+// the corners read, and a faint tiled floor to give a sense of scale
+const TILE = 2;                                // world size of one floor tile
+const floorTex = canvasTexture(16, 16, (ctx) => {
+  ctx.fillStyle = '#ebebef'; ctx.fillRect(0, 0, 16, 16);
+  ctx.fillStyle = '#d3d3da'; ctx.fillRect(0, 0, 16, 1); ctx.fillRect(0, 0, 1, 16);
+}, { mipmaps: true });
+const wall = (color) => new THREE.MeshBasicMaterial({ color, side: THREE.BackSide });
+const room = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), [
+  wall(0xf3f3f6), wall(0xf3f3f6),                                   // +x, -x
+  wall(0xffffff),                                                   // ceiling
+  new THREE.MeshBasicMaterial({ map: floorTex, side: THREE.BackSide }),
+  wall(0xfafafc), wall(0xfafafc),                                   // +z, -z
+]);
+scene.add(room);
+
+// soft round shadow under whatever is on show
+const shadow = new THREE.Mesh(
+  new THREE.CircleGeometry(1, 14),
+  new THREE.MeshBasicMaterial({ color: 0x0a3010, transparent: true, opacity: 0.38, depthWrite: false })
+);
+shadow.rotation.x = -Math.PI / 2;
+shadow.renderOrder = 1;
+scene.add(shadow);
+
+const envButton = document.getElementById('env');
+let env = 'outdoors';
+function setEnv(name) {
+  env = name === 'room' ? 'room' : 'outdoors';
+  const inRoom = env === 'room';
+  outdoors.visible = !inRoom;
+  room.visible = inRoom;
+  scene.background = inRoom ? new THREE.Color(0xffffff) : null;
+  hemi.groundColor.set(inRoom ? 0xd0d0d6 : 0xd8b8c4);   // light bounced off the floor
+  shadow.material.color.set(inRoom ? 0x30303a : 0x0a3010);
+  shadow.material.opacity = inRoom ? 0.22 : 0.38;
+  envButton.textContent = inRoom ? 'BG: white room' : 'BG: outdoors';
+  document.body.dataset.env = env;
+  remember('viewer-env', env);
+}
+setEnv(params.get('env') || recall('viewer-env'));
+envButton.addEventListener('click', () => setEnv(env === 'room' ? 'outdoors' : 'room'));
+
+// ------------------------------------------------------ camera + controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.minPolarAngle = 0.15;
+controls.maxPolarAngle = 1.72;                 // a little below level, never under the floor
+controls.autoRotateSpeed = 0.7;
+
+// the camera only moves when dragged, unless spin is switched on: the button, the S
+// key, or ?spin=on in the URL; the choice is remembered
+const spinButton = document.getElementById('spin');
+function setSpin(on) {
+  controls.autoRotate = on;
+  spinButton.textContent = on ? 'SPIN: on' : 'SPIN: off';
+  spinButton.setAttribute('aria-pressed', String(on));
+  remember('viewer-spin', on ? 'on' : 'off');
+}
+setSpin((params.get('spin') || recall('viewer-spin')) === 'on');
+spinButton.addEventListener('click', () => setSpin(!controls.autoRotate));
+
+// ------------------------------------------------- low-res target + screen
+// The scene is drawn into a small image, then one full-window pass puts it on
+// screen: either as plain hard pixels, or through the CRT filter.
+const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+});
+const screenMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    tScene: { value: sceneRT.texture },
+    uRes: { value: new THREE.Vector2(1, 1) },   // size of the small image
+    uCrt: { value: 1 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene;
+    uniform vec2 uRes;
+    uniform float uCrt;
+    varying vec2 vUv;
+
+    // bulge the picture like curved glass
+    vec2 curve(vec2 uv) {
+      uv = uv * 2.0 - 1.0;
+      vec2 off = abs(uv.yx) / vec2(5.5, 4.5);
+      uv += uv * off * off;
+      uv /= 1.0 + 1.0 / (vec2(5.5, 4.5) * vec2(5.5, 4.5)); // zoom in so the bulged picture still fills the window
+      return uv * 0.5 + 0.5;
+    }
+    // one scanline of the small image, smeared sideways as a tube would
+    vec3 row(vec2 px) {
+      float x = px.x - 0.5, y = floor(px.y) + 0.5;
+      vec3 a = texture2D(tScene, vec2(floor(x) + 0.5, y) / uRes).rgb;
+      vec3 b = texture2D(tScene, vec2(floor(x) + 1.5, y) / uRes).rgb;
+      return mix(a, b, fract(x));
+    }
+    void main() {
+      vec3 col;
+      if (uCrt < 0.5) {
+        col = texture2D(tScene, (floor(vUv * uRes) + 0.5) / uRes).rgb;   // plain hard pixels
+      } else {
+        vec2 uv = curve(vUv);
+        vec2 px = uv * uRes;
+        // colour fringing: red and blue land slightly apart
+        col = vec3(row(px + vec2(0.45, 0.0)).r, row(px).g, row(px - vec2(0.45, 0.0)).b);
+        // scanlines: bright in the middle of each row, dark between rows
+        col *= mix(0.55, 1.18, pow(sin(fract(px.y) * 3.14159), 1.4));
+        // phosphor stripes
+        float stripe = mod(floor(gl_FragCoord.x), 3.0);
+        col *= vec3(stripe == 0.0 ? 1.1 : 0.94, stripe == 1.0 ? 1.1 : 0.94, stripe == 2.0 ? 1.1 : 0.94);
+        // gently darker corners
+        float v = uv.x * (1.0 - uv.x) * uv.y * (1.0 - uv.y) * 16.0;
+        col *= mix(0.74, 1.08, pow(clamp(v, 0.0, 1.0), 0.3));
+      }
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const screenScene = new THREE.Scene();
+const screenQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), screenMaterial);
+screenQuad.frustumCulled = false;
+screenScene.add(screenQuad);
+const screenCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// CRT toggle: the button, the C key, or ?crt=off in the URL; the choice is remembered
+const crtButton = document.getElementById('crt');
+function setCrt(on) {
+  screenMaterial.uniforms.uCrt.value = on ? 1 : 0;
+  crtButton.textContent = on ? 'CRT: on' : 'CRT: off';
+  crtButton.setAttribute('aria-pressed', String(on));
+  remember('cherry-crt', on ? 'on' : 'off');
+}
+setCrt((params.get('crt') || recall('cherry-crt')) !== 'off');
+const crtIsOn = () => screenMaterial.uniforms.uCrt.value > 0.5;
+crtButton.addEventListener('click', () => setCrt(!crtIsOn()));
+
+function resize() {
+  const aspect = innerWidth / innerHeight;
+  const h = RENDER_HEIGHT, w = Math.round(h * aspect);
+  sceneRT.setSize(w, h);
+  screenMaterial.uniforms.uRes.value.set(w, h);
+  shared.uSnap.value.set(w / 2, h / 2);
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
+}
+resize();
+addEventListener('resize', resize);
+
+// ------------------------------------------------------------------ models
+const registry = new Map();
+window.THREE = THREE;
+window.registerModel = (def) => registry.set(def.name, def);
+
+const hint = document.getElementById('hint');
+function fail(message, error) {
+  if (error) console.error(error);
+  hint.textContent = message;
+  hint.className = 'error';
+  hint.style.opacity = 1;
+}
+
+// model files are plain scripts, not modules, so the page also works opened straight from disk
+const loadScript = (src) => new Promise((resolve) => {
+  const s = document.createElement('script');
+  s.src = src;
+  s.onload = resolve;
+  s.onerror = () => { fail(`could not load ${src}`); resolve(); };
+  document.head.appendChild(s);
+});
+
+let current = null;                            // { object, update, bounds }
+const frame = { target: new THREE.Vector3(), dist: 10, rise: 0 };
+
+function disposeModel(object) {
+  object.traverse((o) => {
+    o.geometry?.dispose();
+    for (const m of [].concat(o.material || [])) {
+      for (const v of Object.values(m)) if (v?.isTexture) v.dispose();
+      m.dispose();
+    }
+  });
+}
+
+function resetView() {
+  controls.target.copy(frame.target);
+  camera.position.set(frame.target.x, frame.target.y + frame.rise, frame.target.z + frame.dist);
+  controls.update();
+}
+
+function showModel(name) {
+  const def = registry.get(name);
+  if (!def) return;
+  if (current) { scene.remove(current.object); disposeModel(current.object); current = null; }
+  let built;
+  try {
+    built = def.build({
+      THREE, psx, canvasTexture, mergeGeometries,
+      rand: mulberry32(SEED), seed: SEED, sunDir: SUN_DIR, windDir: WIND_DIR,
+    });
+  } catch (error) {
+    return fail(`${name} failed to build: ${error.message}`, error);
+  }
+  current = built.isObject3D ? { object: built } : built;
+  scene.add(current.object);
+
+  // fit the camera, shadow and room to the model
+  const box = current.bounds || new THREE.Box3().setFromObject(current.object);
+  const size = box.getSize(new THREE.Vector3()), mid = box.getCenter(new THREE.Vector3());
+  const top = Math.max(box.max.y, 0.5), radius = Math.max(size.x, size.z, 0.5) / 2;
+  const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const fit = Math.max((top / 2) / tanV, radius / (tanV * camera.aspect));
+  frame.target.set(mid.x, top * 0.5, mid.z);
+  // a model can adjust its opening view: `back` steps the camera away (1 = snug fit),
+  // `rise` sets its height against the model's middle, as a share of the model's height
+  // (the default sits a little below, looking slightly up)
+  const view = { back: 1, rise: -0.12, ...current.view };
+  frame.dist = (fit * 1.05 + radius * 0.4) * view.back;
+  frame.rise = top * view.rise;
+  controls.minDistance = Math.max(1, radius * 0.6);
+  controls.maxDistance = Math.max(24, frame.dist * 1.6);
+
+  shadow.scale.setScalar(radius * 0.95);
+  shadow.position.set(mid.x, 0.03, mid.z);
+
+  const width = controls.maxDistance * 2 + 6, height = Math.max(16, top * 2);  // the camera stays inside
+  room.scale.set(width, height, width);
+  room.position.set(mid.x, height / 2, mid.z);
+  floorTex.repeat.setScalar(width / TILE);
+
+  resetView();
+  picker.value = name;
+  document.title = `${def.label || name} · Model Viewer`;
+  remember('viewer-model', name);
+}
+
+const picker = document.getElementById('model');
+picker.addEventListener('change', () => { showModel(picker.value); picker.blur(); });
+
+for (const file of MODEL_FILES) await loadScript(`models/${file}.js`);
+for (const def of registry.values()) picker.add(new Option(def.label || def.name, def.name));
+if (registry.size) {
+  const wanted = params.get('model') || recall('viewer-model');
+  showModel(registry.has(wanted) ? wanted : registry.keys().next().value);
+  if (hint.className !== 'error') setTimeout(() => { hint.style.opacity = 0; }, 6000);
+} else if (hint.className !== 'error') {
+  fail('no models: add one to MODEL_FILES in viewer.html');
+}
+
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target === picker) return;
+  const key = e.key.toLowerCase();
+  if (key === 'c') setCrt(!crtIsOn());
+  if (key === 'b') setEnv(env === 'room' ? 'outdoors' : 'room');
+  if (key === 's') setSpin(!controls.autoRotate);
+  if (key === 'r') resetView();
+});
+
+// ------------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let time = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05) * MOTION;
+  time += dt;
+  shared.uTime.value = time;
+  current?.update?.(dt, time);
+  controls.update();
+  sky.position.copy(camera.position);
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(screenScene, screenCamera);
+});
+</script>
+</body>
+</html>
