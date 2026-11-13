@@ -3,17 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cherry Blossom · ASCII</title>
+<title>Cherry Blossom · Low Poly</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   canvas { display: block; cursor: grab; }
   canvas:active { cursor: grabbing; }
   #hint {
     position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
-    font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
-    letter-spacing: 0.12em; color: #d9a3c4; opacity: 0.7;
+    font: bold 13px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    letter-spacing: 0.12em; color: #fff; text-shadow: 1px 1px 0 #1a3a8a;
     pointer-events: none; transition: opacity 2s;
   }
+  #crt {
+    position: fixed; top: 14px; right: 14px; padding: 6px 10px;
+    font: bold 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 0.1em;
+    color: #fff; background: rgba(10, 30, 90, 0.45); border: 1px solid #fff; border-radius: 3px;
+    opacity: 0.6; cursor: pointer;
+  }
+  #crt:hover, #crt:focus-visible { opacity: 1; }
 </style>
 <script type="importmap">
 {
@@ -25,29 +32,26 @@
 </script>
 </head>
 <body>
-<div id="hint">drag to orbit · scroll to zoom</div>
+<div id="hint">drag to orbit · scroll to zoom · C for CRT</div>
+<button id="crt" type="button" aria-pressed="true">CRT: on</button>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
 const SEED = Number(new URLSearchParams(location.search).get('seed')) || 3; // or add ?seed=12 to the URL
-const CELL_W = 5, CELL_H = 9;   // character cell size in CSS pixels
-const GLYPHS = " .':;!+*oxXO%#8@";   // dark -> bright
-const BLOOM = { strength: 0.35, radius: 0.25, threshold: 0.15 };
-const PETAL_COUNT = 260;
-const PALETTE = {
-  bark: 0xa67c66,
-  blossoms: [0xffe9f1, 0xffd3e2, 0xfbb9cf, 0xf29dbd, 0xd4688f], // pale petals -> deep centres
-  petal: 0xe3a7bf,
-  ground: 0x9c5f7c,
-};
+const RENDER_HEIGHT = 300;      // internal resolution in pixels; lower = chunkier
+const PETAL_COUNT = 160;
+const IDLE_SECONDS = 10;        // the camera starts orbiting by itself after this long without input
+const SUN_DIR = new THREE.Vector3(-0.45, 0.42, -0.8).normalize();
 const WIND_DIR = new THREE.Vector3(1, 0, 0.35).normalize();
+const PALETTE = {
+  bark: 0x8a6048,
+  blossoms: [0xffe6f0, 0xffd3e3, 0xffc0d8, 0xffaecd],
+  petal: 0xffc4da,
+};
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const MOTION = reducedMotion ? 0.35 : 1;
@@ -63,32 +67,145 @@ function mulberry32(a) {
 }
 const rand = mulberry32(SEED);
 const rr = (a, b) => a + (b - a) * rand();
+const pick = (list) => list[(rand() * list.length) | 0];
 const randomUnit = () =>
   new THREE.Vector3(rr(-1, 1), rr(-1, 1), rr(-1, 1)).normalize();
 
 // ------------------------------------------------------------ scene setup
 const renderer = new THREE.WebGLRenderer({ antialias: false });
-renderer.setClearColor(0x000000, 1);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0x000000, 8, 24);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 1200);
 
-const TARGET = new THREE.Vector3(0, 3.4, 0); // re-centred on the canopy once the tree is grown
-const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xd8b8c4, 2.6));
+const sun = new THREE.DirectionalLight(0xfff6e0, 2.0);
+sun.position.copy(SUN_DIR).multiplyScalar(50);
+scene.add(sun);
 
-scene.add(new THREE.HemisphereLight(0xfff4f0, 0x2a1a18, 1.0));
-const key = new THREE.DirectionalLight(0xffffff, 2.8);
-scene.add(key, key.target); // the key light follows the camera (see the loop) so every side reads well
+// --------------------------------------------------------- pixel textures
+function canvasTexture(w, h, paint, { pixelated = true, mipmaps = false } = {}) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  paint(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.magFilter = pixelated ? THREE.NearestFilter : THREE.LinearFilter;
+  t.minFilter = mipmaps ? THREE.LinearMipmapLinearFilter : (pixelated ? THREE.NearestFilter : THREE.LinearFilter);
+  t.generateMipmaps = mipmaps;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
 
-// -------------------------------------------------------------- wind sway
-// One displacement function shared by bark and blossoms, so they move together.
-const wind = { uTime: { value: 0 }, uWind: { value: MOTION } };
-const WIND_GLSL = /* glsl */`
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+const GRASS_SIZE = 64;
+const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
+  const G = 8, grid = Array.from({ length: G * G }, () => rand());
+  const patch = (x, y) => {                    // smooth noise that repeats every w pixels
+    const fx = (x / w) * G, fy = (y / h) * G, x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const u = fx - x0, v = fy - y0, at = (i, j) => grid[((j + G) % G) * G + ((i + G) % G)];
+    const L = THREE.MathUtils.lerp;
+    return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
+  };
+  const greens = ['#2c8f22', '#3aa628', '#4dbb2e', '#62cc36', '#7cdc40'];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const n = patch(x, y) + rr(-0.16, 0.16);
+    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    ctx.fillRect(x, y, 1, 1);
+  }
+  const blades = ['#9be84c', '#b4f060', '#84de42', '#247c1c', '#1f6e1a'];
+  for (let i = 0; i < 520; i++) {
+    let x = (rand() * w) | 0, y = (rand() * h) | 0;
+    const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
+    ctx.fillStyle = pick(blades);
+    for (let k = 0; k < len; k++) {
+      ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
+      y -= 1; if (k % 2 === 1) x += lean;
+    }
+  }
+}, { mipmaps: true });
+
+const barkTex = canvasTexture(8, 16, (ctx) => {
+  const browns = ['#ffffff', '#e6d8cf', '#cdbbae', '#f2e8e2'];
+  for (let x = 0; x < 8; x++) {
+    const streak = pick(browns);
+    for (let y = 0; y < 16; y++) {
+      ctx.fillStyle = rand() < 0.3 ? pick(browns) : streak; ctx.fillRect(x, y, 1, 1);
+    }
+  }
+});
+
+// a bunch of blossom: little five-petal flowers scattered on a transparent square,
+// thicker in the middle and ragged at the edge, with a few dark buds
+const blossomTex = canvasTexture(32, 32, (ctx) => {
+  const petals = ['#ffffff', '#ffffff', '#fff2f7', '#ffe4ee', '#ffd6e6'];
+  const flower = (x, y) => {
+    ctx.fillStyle = pick(petals);
+    ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3);       // plus shape
+    if (rand() < 0.6) ctx.fillRect(x - 1 + 2 * ((rand() * 2) | 0), y - 1 + 2 * ((rand() * 2) | 0), 1, 1); // odd extra petal
+    ctx.fillStyle = rand() < 0.5 ? '#e87aa4' : '#f29dbd';            // centre
+    ctx.fillRect(x, y, 1, 1);
+  };
+  for (let i = 0; i < 9; i++) {                                       // buds and stems behind the flowers
+    const a = rr(0, 6.28), r = rr(2, 13);
+    ctx.fillStyle = pick(['#c2567f', '#a8506a', '#8a5a48']);
+    ctx.fillRect(Math.round(16 + Math.cos(a) * r), Math.round(16 + Math.sin(a) * r), 1, 1);
+  }
+  for (let i = 0; i < 46; i++) {
+    const a = rr(0, 6.28), r = Math.pow(rand(), 0.75) * 13;
+    flower(Math.round(16 + Math.cos(a) * r), Math.round(16 + Math.sin(a) * r));
+  }
+});
+
+// sky: blue gradient with wispy clouds, painted once from layered noise
+function hash3(x, y, z) {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2147483647) ^ (SEED * 9781);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise3(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const s = (t) => t * t * (3 - 2 * t);
+  const u = s(x - xi), v = s(y - yi), w = s(z - zi);
+  const L = THREE.MathUtils.lerp;
+  const at = (a, b, c) => hash3(xi + a, yi + b, zi + c);
+  return L(
+    L(L(at(0, 0, 0), at(1, 0, 0), u), L(at(0, 1, 0), at(1, 1, 0), u), v),
+    L(L(at(0, 0, 1), at(1, 0, 1), u), L(at(0, 1, 1), at(1, 1, 1), u), v), w);
+}
+const skyTex = canvasTexture(512, 256, (ctx, w, h) => {
+  const img = ctx.createImageData(w, h);
+  const top = [10, 62, 214], low = [96, 170, 255];
+  for (let y = 0; y < h; y++) {
+    const up = Math.max(0, 1 - y / (h / 2));           // 1 at the zenith, 0 at the horizon and below
+    for (let x = 0; x < w; x++) {
+      const a = (x / w) * Math.PI * 2;                 // sampled around a circle so the seam matches
+      let n = 0, amp = 0.5, f = 1;
+      for (let o = 0; o < 5; o++) {
+        n += amp * noise3(Math.cos(a) * 2.2 * f, Math.sin(a) * 2.2 * f, (y / h) * 9 * f + o * 7.3);
+        amp *= 0.5; f *= 2;
+      }
+      const cloud = THREE.MathUtils.smoothstep(n, 0.4, 0.62) * THREE.MathUtils.smoothstep(up, 0.02, 0.3);
+      const g = Math.pow(up, 0.7);
+      const i = (y * w + x) * 4;
+      for (let k = 0; k < 3; k++) img.data[i + k] = THREE.MathUtils.lerp(THREE.MathUtils.lerp(low[k], top[k], g), 255, cloud);
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}, { pixelated: false });
+skyTex.wrapT = THREE.ClampToEdgeWrapping;
+
+// ------------------------------------------------ PS1-style vertex shader
+// Every material gets vertex snapping (the wobble of old consoles); the tree
+// also gets wind, from one function so bark and blossom move together.
+const shared = { uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) } };
+const PSX_GLSL = /* glsl */`
   uniform float uTime;
   uniform float uWind;
+  uniform vec2 uSnap;
   vec3 windOffset(vec3 p) {
-    float flex = smoothstep(2.2, 9.0, p.y) * 0.75 + 0.05 * length(p.xz);
+    float flex = smoothstep(2.2, 9.0, p.y) * 0.75 + 0.03 * length(p.xz);
     float gust = 0.3
       + 0.6 * sin(uTime * 0.9 + p.x * 0.35 + p.z * 0.25)
       + 0.25 * sin(uTime * 2.3 + p.x * 1.3 + p.y * 0.9);
@@ -98,7 +215,7 @@ const WIND_GLSL = /* glsl */`
     return o * uWind;
   }
 `;
-const WIND_PROJECT_GLSL = /* glsl */`
+const PSX_PROJECT_GLSL = /* glsl */`
   vec4 wPos = vec4(transformed, 1.0);
   #ifdef USE_INSTANCING
     wPos = instanceMatrix * wPos;
@@ -107,149 +224,173 @@ const WIND_PROJECT_GLSL = /* glsl */`
   wPos.xyz += windOffset(wPos.xyz);
   vec4 mvPosition = viewMatrix * wPos;
   gl_Position = projectionMatrix * mvPosition;
+  gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;
 `;
-function applyWind(material) {
+function psx(material, windAmount = 0) {
+  const uWind = { value: windAmount };
   material.onBeforeCompile = (shader) => {
-    shader.uniforms.uTime = wind.uTime;
-    shader.uniforms.uWind = wind.uWind;
+    shader.uniforms.uTime = shared.uTime;
+    shader.uniforms.uSnap = shared.uSnap;
+    shader.uniforms.uWind = uWind;
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\n' + WIND_GLSL)
-      .replace('#include <project_vertex>', WIND_PROJECT_GLSL);
+      .replace('#include <common>', '#include <common>\n' + PSX_GLSL)
+      .replace('#include <project_vertex>', PSX_PROJECT_GLSL);
   };
+  material.customProgramCacheKey = () => 'psx';
   return material;
 }
 
+// ------------------------------------------------------------ sky + ground
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(900, 24, 12),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, depthWrite: false, fog: false })
+);
+sky.renderOrder = -1;
+scene.add(sky);
+
+{
+  const R = 600, TEXEL = 0.1;                  // world size of one grass pixel
+  grassTex.repeat.setScalar((R * 2) / (GRASS_SIZE * TEXEL));
+  const ground = new THREE.Mesh(
+    new THREE.CircleGeometry(R, 24),
+    new THREE.MeshLambertMaterial({ map: grassTex })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
+}
+
 // ------------------------------------------------------------------- tree
-// A straight trunk that forks into a few rising limbs (vase shape), long slender
-// branches with side shoots, and small tufts of blossom along every twig.
-const MAX_DEPTH = 7;
-const BLOSSOM_FROM = 6;
-const MIN_R = 0.011;
+// A straight trunk forking into five rising limbs, a few levels of branches,
+// and bunches of blossom on the outer ones.
+const MAX_DEPTH = 5;
+const MIN_R = 0.035;
 const UP = new THREE.Vector3(0, 1, 0);
 const segments = [];
-const blossoms = []; // { p: Vector3, s: size, lift: -1..1 height within its tuft }
+const blobs = []; // { p: Vector3, s: radius }
 
 function addSegment(a, b, ra, rb) {
   const d = new THREE.Vector3().subVectors(b, a);
   const len = d.length();
-  const g = new THREE.CylinderGeometry(rb, ra, len, ra > 0.05 ? 7 : 4, 1, true);
+  const g = new THREE.CylinderGeometry(rb, ra, len, ra > 0.12 ? 6 : 4, 1, true);
   g.translate(0, len / 2, 0);
   g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, d.normalize()));
   g.translate(a.x, a.y, a.z);
   segments.push(g);
 }
 
-function addTuft(p, count) {
-  const c = p.clone().addScaledVector(randomUnit(), rr(0, 0.07));
-  for (let i = 0; i < count; i++) {
-    const o = randomUnit().multiplyScalar(rr(0.02, 0.12));
-    blossoms.push({ p: c.clone().add(o), s: rr(0.035, 0.07), lift: o.y / 0.12 });
-  }
+function addBlob(p, size) {
+  blobs.push({ p: p.clone().addScaledVector(randomUnit(), rr(0, 0.25)), s: size * rr(0.8, 1.2) });
 }
 
 function grow(start, dir, length, radius, depth) {
-  const steps = depth === 0 ? 5 : 3;
-  const endR = Math.max(radius * (depth === 0 ? 0.8 : 0.72), MIN_R);
+  const steps = depth === 0 ? 3 : 2;
+  const endR = Math.max(radius * 0.75, MIN_R);
   const p = start.clone();
   const d = dir.clone();
   for (let i = 0; i < steps; i++) {
-    d.addScaledVector(randomUnit(), depth === 0 ? 0.06 : 0.2);  // gnarl
-    if (depth >= 1 && depth <= 4) d.y += 0.07;                  // limbs reach upward
-    if (depth >= 6) d.y -= 0.05;                                // tips arch over
+    d.addScaledVector(randomUnit(), depth === 0 ? 0.05 : 0.22); // gnarl
+    if (depth >= 1 && depth <= 2) d.y += 0.08;                  // limbs reach upward
+    if (depth === MAX_DEPTH) d.y -= 0.06;                       // tips arch over
     d.normalize();
     const q = p.clone().addScaledVector(d, length / steps);
     let ra = THREE.MathUtils.lerp(radius, endR, i / steps);
     const rb = THREE.MathUtils.lerp(radius, endR, (i + 1) / steps);
-    if (depth === 0 && i === 0) ra *= 1.45;                     // root flare
+    if (depth === 0 && i === 0) ra *= 1.4;                      // root flare
     addSegment(p, q, ra, rb);
     p.copy(q);
-    if (depth >= BLOSSOM_FROM) addTuft(p, depth === BLOSSOM_FROM ? 2 : 3);
-    // side shoot partway along the branch
-    if (depth >= 2 && depth <= 5 && i < steps - 1 && rand() < 0.28) {
-      const axis = new THREE.Vector3().crossVectors(d, randomUnit()).normalize();
-      const sd = d.clone().applyAxisAngle(axis, rr(0.6, 1.1));
-      sd.y += 0.15;
-      grow(p, sd.normalize(), length * rr(0.45, 0.65), Math.max(rb * 0.5, MIN_R), Math.min(depth + 2, MAX_DEPTH));
-    }
+    if (depth >= MAX_DEPTH - 2) addBlob(p, 0.42);
   }
-  if (depth === MAX_DEPTH) { addTuft(p, 4); return; }
+  if (depth === MAX_DEPTH) { addBlob(p, 0.52); return; }
 
-  const n = depth === 0 ? 5 : (rand() < (depth < 3 ? 0.5 : 0.3) ? 3 : 2);
+  const n = depth === 0 ? 5 : (rand() < 0.4 ? 3 : 2);
   const base = new THREE.Vector3().crossVectors(d, randomUnit()).normalize();
   for (let k = 0; k < n; k++) {
     const axis = base.clone().applyAxisAngle(d, (k / n) * Math.PI * 2 + rr(-0.45, 0.45));
     const cd = d.clone().applyAxisAngle(axis, depth === 0 ? rr(0.55, 0.95) : rr(0.35, 0.8));
-    cd.y = Math.max(cd.y, depth < 5 ? 0.15 : -0.3);
+    cd.y = Math.max(cd.y, depth < 3 ? 0.15 : -0.3);
     cd.normalize();
-    const childLen = depth === 0 ? rr(1.7, 2.1) : length * rr(0.76, 0.9);
+    const childLen = depth === 0 ? rr(1.7, 2.1) : length * rr(0.78, 0.9);
     grow(p, cd, childLen, Math.max(endR * rr(0.62, 0.75), MIN_R), depth + 1);
   }
 }
-grow(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0.05, 1, 0.02).normalize(), 2.6, 0.26, 0);
+grow(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0.05, 1, 0.02).normalize(), 2.6, 0.3, 0);
 
-// centre the view on the canopy and measure it, so the camera can frame any seed
-const bounds = new THREE.Box3().setFromPoints(blossoms.map((b) => b.p));
-const treeTop = bounds.max.y + 0.3;
-TARGET.set((bounds.min.x + bounds.max.x) / 2, treeTop / 2, (bounds.min.z + bounds.max.z) / 2);
-const treeRadius = 0.3 + blossoms.reduce((m, b) => Math.max(m, Math.hypot(b.p.x - TARGET.x, b.p.z - TARGET.z)), 0);
+// measure the canopy so the camera and ground decorations fit any seed
+const bounds = new THREE.Box3().setFromPoints(blobs.map((b) => b.p));
+const treeTop = bounds.max.y + 0.8;
 const canopyCentre = bounds.getCenter(new THREE.Vector3());
-const canopyRadius = bounds.getSize(new THREE.Vector3()).length() / 2;
+const centre = canopyCentre;
+const treeRadius = 0.8 + blobs.reduce((m, b) => Math.max(m, Math.hypot(b.p.x - centre.x, b.p.z - centre.z)), 0);
+const TARGET = new THREE.Vector3(centre.x, treeTop * 0.5, centre.z);
 
 const bark = new THREE.Mesh(
   mergeGeometries(segments),
-  applyWind(new THREE.MeshLambertMaterial({ color: PALETTE.bark }))
+  psx(new THREE.MeshLambertMaterial({ color: PALETTE.bark, map: barkTex, flatShading: true }), MOTION)
 );
 scene.add(bark);
 segments.forEach((g) => g.dispose());
 
-// blossoms
 const dummy = new THREE.Object3D();
 const tmpColor = new THREE.Color();
-const blossomColors = PALETTE.blossoms.map((c) => new THREE.Color(c));
-const blossomMesh = new THREE.InstancedMesh(
-  new THREE.OctahedronGeometry(1, 0),
-  applyWind(new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true })),
-  blossoms.length
-);
-blossoms.forEach((b, i) => {
-  dummy.position.copy(b.p);
-  dummy.rotation.set(rr(0, 6.28), rr(0, 6.28), rr(0, 6.28));
-  dummy.scale.setScalar(b.s);
-  dummy.updateMatrix();
-  blossomMesh.setMatrixAt(i, dummy.matrix);
-  // shading baked into colour: the canopy's interior and the underside of each tuft are darker
-  const edge = THREE.MathUtils.smoothstep(b.p.distanceTo(canopyCentre) / canopyRadius, 0.2, 0.8);
-  const shade = THREE.MathUtils.lerp(0.68, 1, edge) * (0.82 + 0.18 * b.lift) * rr(0.85, 1.1);
-  const idx = rand() < 0.06 ? 4 : Math.floor(Math.pow(rand(), 1.6) * 4);
-  tmpColor.copy(blossomColors[idx]).multiplyScalar(shade);
-  blossomMesh.setColorAt(i, tmpColor);
-});
-blossomMesh.frustumCulled = false;
-scene.add(blossomMesh);
-
-// petals already on the ground
 {
-  const N = 1200;
-  const ground = new THREE.InstancedMesh(
-    new THREE.PlaneGeometry(0.1, 0.08),
-    new THREE.MeshBasicMaterial({ color: PALETTE.ground, side: THREE.DoubleSide }),
+  // each bunch is three crossed squares carrying the cut-out blossom texture
+  const card = new THREE.PlaneGeometry(1, 1);
+  const bunch = mergeGeometries([card, card.clone().rotateY(Math.PI / 2), card.clone().rotateX(Math.PI / 2)]);
+  const mesh = new THREE.InstancedMesh(
+    bunch,
+    psx(new THREE.MeshBasicMaterial({ map: blossomTex, alphaTest: 0.5, side: THREE.DoubleSide }), MOTION),
+    blobs.length
+  );
+  const outward = new THREE.Vector3();
+  blobs.forEach((b, i) => {
+    dummy.position.copy(b.p);
+    dummy.rotation.set(rr(0, 6.28), rr(0, 6.28), rr(0, 6.28));
+    dummy.scale.setScalar(b.s * 2.6);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    // shading is baked into colour: darker low in the canopy, brighter on the side facing the sun
+    const height = (b.p.y - bounds.min.y) / (bounds.max.y - bounds.min.y);
+    const sunny = Math.max(0, outward.subVectors(b.p, canopyCentre).normalize().dot(SUN_DIR));
+    tmpColor.set(pick(PALETTE.blossoms)).multiplyScalar((0.74 + 0.16 * height + 0.14 * sunny) * rr(0.94, 1.04));
+    mesh.setColorAt(i, tmpColor);
+  });
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+}
+
+// round blob shadow under the tree, and petals already on the grass
+{
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(treeRadius * 0.95, 14),
+    new THREE.MeshBasicMaterial({ color: 0x0a3010, transparent: true, opacity: 0.38, depthWrite: false })
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.set(centre.x, 0.03, centre.z);
+  shadow.renderOrder = 1;
+  scene.add(shadow);
+
+  const N = 420;
+  const fallen = new THREE.InstancedMesh(
+    new THREE.PlaneGeometry(0.2, 0.16),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }),
     N
   );
   for (let i = 0; i < N; i++) {
-    const r = Math.pow(rand(), 0.7) * treeRadius * 1.15, a = rr(0, Math.PI * 2);
-    dummy.position.set(TARGET.x + Math.cos(a) * r + WIND_DIR.x * 0.8, 0.01, TARGET.z + Math.sin(a) * r + WIND_DIR.z * 0.8);
+    const r = Math.pow(rand(), 0.7) * treeRadius * 1.3, a = rr(0, Math.PI * 2);
+    dummy.position.set(centre.x + Math.cos(a) * r + WIND_DIR.x, 0.06, centre.z + Math.sin(a) * r + WIND_DIR.z);
     dummy.rotation.set(-Math.PI / 2, 0, rr(0, 6.28));
-    dummy.scale.setScalar(rr(0.7, 1.4));
+    dummy.scale.setScalar(rr(0.7, 1.3));
     dummy.updateMatrix();
-    ground.setMatrixAt(i, dummy.matrix);
-    ground.setColorAt(i, tmpColor.setScalar(rr(0.45, 1.3)));
+    fallen.setMatrixAt(i, dummy.matrix);
+    fallen.setColorAt(i, tmpColor.set(pick(PALETTE.blossoms)));
   }
-  scene.add(ground);
+  fallen.renderOrder = 2;
+  scene.add(fallen);
 }
 
 // ---------------------------------------------------------- falling petals
 const petalMesh = new THREE.InstancedMesh(
-  new THREE.PlaneGeometry(0.07, 0.055),
+  new THREE.PlaneGeometry(0.2, 0.16),
   new THREE.MeshBasicMaterial({ color: PALETTE.petal, side: THREE.DoubleSide }),
   PETAL_COUNT
 );
@@ -262,10 +403,11 @@ const petals = Array.from({ length: PETAL_COUNT }, () => ({
   vy: 0, phase: 0, delay: 0, rest: 0, landed: false,
 }));
 function respawn(p, first) {
-  p.pos.copy(blossoms[(Math.random() * blossoms.length) | 0].p);
+  const b = blobs[(Math.random() * blobs.length) | 0];
+  p.pos.set(b.p.x + R(-b.s, b.s), b.p.y - b.s * 0.5, b.p.z + R(-b.s, b.s));
   p.rot.set(R(0, 6.28), R(0, 6.28), R(0, 6.28));
   p.spin.set(R(-3, 3), R(-3, 3), R(-3, 3));
-  p.vy = R(0.45, 0.95);
+  p.vy = R(0.5, 1.0);
   p.phase = R(0, 6.28);
   p.delay = first ? R(0, 10) : R(0, 3);
   p.landed = false;
@@ -288,8 +430,8 @@ function updatePetals(dt, t) {
       p.pos.z += (WIND_DIR.z * drift + Math.cos(t * 1.7 + p.phase) * 0.3) * dt;
       p.pos.y -= p.vy * (0.75 + 0.25 * Math.sin(t * 3.0 + p.phase)) * dt;
       p.rot.x += p.spin.x * dt; p.rot.y += p.spin.y * dt; p.rot.z += p.spin.z * dt;
-      if (p.pos.y <= 0.02) {
-        p.pos.y = 0.02; p.landed = true; p.rest = R(4, 10);
+      if (p.pos.y <= 0.07) {
+        p.pos.y = 0.07; p.landed = true; p.rest = R(4, 10);
         p.rot.set(-Math.PI / 2, 0, R(0, 6.28));
       }
     }
@@ -304,112 +446,157 @@ function updatePetals(dt, t) {
 // run the petals forward a little so some are already in the air on load
 for (let t = 0; t < 12; t += 0.05) updatePetals(0.05, t);
 
-// ------------------------------------------------------------- ASCII pass
-// The scene is rendered into a tiny target with one pixel per character cell;
-// the shader then swaps each cell for a glyph chosen by brightness.
-const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
-  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-  type: THREE.HalfFloatType, samples: 4,
-});
-
-function makeGlyphAtlas(dpr) {
-  const cw = Math.round(CELL_W * dpr * 2), ch = Math.round(CELL_H * dpr * 2);
-  const c = document.createElement('canvas');
-  c.width = cw * GLYPHS.length; c.height = ch;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
-  ctx.fillStyle = '#fff';
-  ctx.font = `bold ${Math.round(ch * 0.82)}px ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace`;
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  for (let i = 0; i < GLYPHS.length; i++) ctx.fillText(GLYPHS[i], (i + 0.5) * cw, ch * 0.52);
-  const tex = new THREE.CanvasTexture(c);
-  tex.generateMipmaps = false;
-  tex.minFilter = tex.magFilter = THREE.LinearFilter;
-  return tex;
+// -------------------------------------------------------------- lens flare
+{
+  const glow = canvasTexture(64, 64, (ctx) => {
+    const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.25, 'rgba(255,250,220,0.7)'); g.addColorStop(1, 'rgba(255,240,200,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+  }, { pixelated: false });
+  const hexagon = canvasTexture(64, 64, (ctx) => {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) ctx.lineTo(32 + 29 * Math.cos((i * Math.PI) / 3), 32 + 29 * Math.sin((i * Math.PI) / 3));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fill();
+  }, { pixelated: false });
+  const flare = new Lensflare();
+  flare.position.copy(SUN_DIR).multiplyScalar(800);
+  flare.addElement(new LensflareElement(glow, 80, 0, new THREE.Color(0xffffff)));
+  flare.addElement(new LensflareElement(hexagon, 26, 0.3, new THREE.Color(0x9a8cff)));
+  flare.addElement(new LensflareElement(hexagon, 46, 0.5, new THREE.Color(0x7f9dff)));
+  flare.addElement(new LensflareElement(hexagon, 34, 0.75, new THREE.Color(0x8fe0b0)));
+  flare.addElement(new LensflareElement(hexagon, 22, 1.0, new THREE.Color(0xb0c8ff)));
+  scene.add(flare);
 }
-
-const AsciiShader = {
-  uniforms: {
-    tScene: { value: null },
-    tGlyphs: { value: null },
-    uGrid: { value: new THREE.Vector2(1, 1) },
-    uGlyphCount: { value: GLYPHS.length },
-  },
-  vertexShader: /* glsl */`
-    varying vec2 vUv;
-    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
-  `,
-  fragmentShader: /* glsl */`
-    uniform sampler2D tScene;
-    uniform sampler2D tGlyphs;
-    uniform vec2 uGrid;
-    uniform float uGlyphCount;
-    varying vec2 vUv;
-    void main() {
-      vec2 g = vUv * uGrid;
-      vec2 cell = floor(g);
-      vec2 f = fract(g);
-      vec3 c = texture2D(tScene, (cell + 0.5) / uGrid).rgb;
-      float lum = max(c.r, max(c.g, c.b));
-      float t = clamp(lum, 0.0, 1.0);
-      if (t < 0.02) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-      float idx = max(1.0, floor(pow(t, 0.6) * (uGlyphCount - 1.0) + 0.5));
-      float mask = texture2D(tGlyphs, vec2((idx + f.x) / uGlyphCount, f.y)).r;
-      vec3 hue = pow(c / lum, vec3(1.5)); // deepen colour so pale pinks don't wash out to white
-      gl_FragColor = vec4(hue * mix(0.4, 1.0, t) * mask, 1.0);
-    }
-  `,
-};
-
-const composer = new EffectComposer(renderer);
-const asciiPass = new ShaderPass(AsciiShader);
-asciiPass.uniforms.tScene.value = sceneRT.texture;
-composer.addPass(asciiPass);
-const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), BLOOM.strength, BLOOM.radius, BLOOM.threshold);
-composer.addPass(bloomPass);
-composer.addPass(new OutputPass());
 
 // ------------------------------------------------------ camera + controls
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.copy(TARGET);
 controls.enableDamping = true;
 controls.enablePan = false;
-controls.minDistance = 5;
-controls.minPolarAngle = 0.35;
-controls.maxPolarAngle = Math.PI / 2 - 0.03;
-controls.autoRotate = !reducedMotion;
+controls.minDistance = 4;
+controls.maxDistance = 24;
+controls.minPolarAngle = 0.5;
+controls.maxPolarAngle = 1.72;                 // a little below level, never under the grass
+controls.autoRotate = false;
 controls.autoRotateSpeed = 0.7;
 
-let glyphDpr = 0;
-function resize() {
-  const w = innerWidth, h = innerHeight;
-  const dpr = Math.min(devicePixelRatio || 1, 2);
-  renderer.setPixelRatio(dpr);
-  renderer.setSize(w, h);
-  composer.setPixelRatio(dpr);
-  composer.setSize(w, h);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
+// the camera stays put until it has been left alone for a while, then orbits
+// until the next drag or zoom
+let idleTimer = 0;
+function waitForIdle() {
+  clearTimeout(idleTimer);
+  if (!reducedMotion) idleTimer = setTimeout(() => { controls.autoRotate = true; }, IDLE_SECONDS * 1000);
+}
+controls.addEventListener('start', () => { controls.autoRotate = false; clearTimeout(idleTimer); });
+controls.addEventListener('end', waitForIdle);
+waitForIdle();
 
-  const cols = Math.max(1, Math.floor(w / CELL_W)), rows = Math.max(1, Math.floor(h / CELL_H));
-  sceneRT.setSize(cols, rows);
-  asciiPass.uniforms.uGrid.value.set(cols, rows);
-  if (dpr !== glyphDpr) {
-    asciiPass.uniforms.tGlyphs.value?.dispose();
-    asciiPass.uniforms.tGlyphs.value = makeGlyphAtlas(dpr);
-    glyphDpr = dpr;
-  }
+// ------------------------------------------------- low-res target + screen
+// The scene is drawn into a small image, then one full-window pass puts it on
+// screen: either as plain hard pixels, or through the CRT filter.
+const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+});
+const screenMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    tScene: { value: sceneRT.texture },
+    uRes: { value: new THREE.Vector2(1, 1) },   // size of the small image
+    uCrt: { value: 1 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene;
+    uniform vec2 uRes;
+    uniform float uCrt;
+    varying vec2 vUv;
+
+    // bulge the picture like curved glass
+    vec2 curve(vec2 uv) {
+      uv = uv * 2.0 - 1.0;
+      vec2 off = abs(uv.yx) / vec2(5.5, 4.5);
+      uv += uv * off * off;
+      uv /= 1.0 + 1.0 / (vec2(5.5, 4.5) * vec2(5.5, 4.5)); // zoom in so the bulged picture still fills the window
+      return uv * 0.5 + 0.5;
+    }
+    // one scanline of the small image, smeared sideways as a tube would
+    vec3 row(vec2 px) {
+      float x = px.x - 0.5, y = floor(px.y) + 0.5;
+      vec3 a = texture2D(tScene, vec2(floor(x) + 0.5, y) / uRes).rgb;
+      vec3 b = texture2D(tScene, vec2(floor(x) + 1.5, y) / uRes).rgb;
+      return mix(a, b, fract(x));
+    }
+    void main() {
+      vec3 col;
+      if (uCrt < 0.5) {
+        col = texture2D(tScene, (floor(vUv * uRes) + 0.5) / uRes).rgb;   // plain hard pixels
+      } else {
+        vec2 uv = curve(vUv);
+        vec2 px = uv * uRes;
+        // colour fringing: red and blue land slightly apart
+        col = vec3(row(px + vec2(0.45, 0.0)).r, row(px).g, row(px - vec2(0.45, 0.0)).b);
+        // scanlines: bright in the middle of each row, dark between rows
+        col *= mix(0.55, 1.18, pow(sin(fract(px.y) * 3.14159), 1.4));
+        // phosphor stripes
+        float stripe = mod(floor(gl_FragCoord.x), 3.0);
+        col *= vec3(stripe == 0.0 ? 1.1 : 0.94, stripe == 1.0 ? 1.1 : 0.94, stripe == 2.0 ? 1.1 : 0.94);
+        // gently darker corners
+        float v = uv.x * (1.0 - uv.x) * uv.y * (1.0 - uv.y) * 16.0;
+        col *= mix(0.74, 1.08, pow(clamp(v, 0.0, 1.0), 0.3));
+      }
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const screenScene = new THREE.Scene();
+const screenQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), screenMaterial);
+screenQuad.frustumCulled = false;
+screenScene.add(screenQuad);
+const screenCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// CRT toggle: the button, the C key, or ?crt=off in the URL; the choice is remembered
+const crtButton = document.getElementById('crt');
+function setCrt(on) {
+  screenMaterial.uniforms.uCrt.value = on ? 1 : 0;
+  crtButton.textContent = on ? 'CRT: on' : 'CRT: off';
+  crtButton.setAttribute('aria-pressed', String(on));
+  try { localStorage.setItem('cherry-crt', on ? 'on' : 'off'); } catch {}
+}
+{
+  let saved = null;
+  try { saved = localStorage.getItem('cherry-crt'); } catch {}
+  setCrt((new URLSearchParams(location.search).get('crt') || saved) !== 'off');
+}
+const crtIsOn = () => screenMaterial.uniforms.uCrt.value > 0.5;
+crtButton.addEventListener('click', () => setCrt(!crtIsOn()));
+addEventListener('keydown', (e) => {
+  if (e.key.toLowerCase() === 'c' && !e.ctrlKey && !e.metaKey && !e.altKey) setCrt(!crtIsOn());
+});
+
+function resize() {
+  const aspect = innerWidth / innerHeight;
+  const h = RENDER_HEIGHT, w = Math.round(h * aspect);
+  sceneRT.setSize(w, h);
+  screenMaterial.uniforms.uRes.value.set(w, h);
+  shared.uSnap.value.set(w / 2, h / 2);
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
 }
 resize();
 addEventListener('resize', resize);
 
-// start far enough back that the whole tree fits, in portrait or landscape
 {
   const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const fit = Math.max((treeTop / 2) / tanV, treeRadius / (tanV * camera.aspect));
-  const dist = fit * 1.02 + treeRadius * 0.4;
-  camera.position.set(TARGET.x, TARGET.y + 0.8, TARGET.z + dist);
-  controls.maxDistance = dist * 1.8;
+  const dist = Math.min(fit * 1.05 + treeRadius * 0.4, controls.maxDistance);
+  camera.position.set(TARGET.x, TARGET.y - 1.2, TARGET.z + dist);
   controls.update();
 }
 
@@ -418,29 +605,17 @@ setTimeout(() => { document.getElementById('hint').style.opacity = 0; }, 5000);
 // ------------------------------------------------------------------- loop
 const clock = new THREE.Clock();
 let time = 0;
-const camRight = new THREE.Vector3();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05) * MOTION;
   time += dt;
-  wind.uTime.value = time;
+  shared.uTime.value = time;
   updatePetals(dt, time);
   controls.update();
-
-  // fade the far side of the tree for depth
-  const d = camera.position.distanceTo(controls.target);
-  scene.fog.near = d - treeRadius;
-  scene.fog.far = d + treeRadius * 2.2;
-
-  // keep the key light up and to the right of the viewer
-  key.target.position.copy(controls.target);
-  key.position.copy(camera.position)
-    .addScaledVector(camRight.setFromMatrixColumn(camera.matrixWorld, 0), d * 0.45);
-  key.position.y += d * 0.55;
-
+  sky.position.copy(camera.position);
   renderer.setRenderTarget(sceneRT);
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
-  composer.render();
+  renderer.render(screenScene, screenCamera);
 });
 </script>
 </body>
