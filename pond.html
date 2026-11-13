@@ -34,26 +34,27 @@
 </script>
 </head>
 <body>
-<div class="bar"><button id="crt" type="button" aria-pressed="true">CRT: on</button></div>
-<div id="hint">scroll to zoom in · drag to look around<br>C CRT · R default view</div>
+<div class="bar"><button id="bloom" type="button" aria-pressed="true">BLOOM: on</button><button id="crt" type="button" aria-pressed="true">CRT: on</button></div>
+<div id="hint">scroll to zoom in · drag to look around<br>C CRT · G bloom · R default view</div>
 <script type="module">
 // Koi pond: the ASCII pond from the ascii_pond project, remade in the low-poly
 // renderer. So far: the water and its pebbled floor, five koi (models/koi.js)
 // wandering under the surface, boulders and pebbles round the rim, and the foliage:
 // lily pads, two stands of reeds and cattails, grass round the banks, and the cherry
-// tree (models/cherry-tree.js) leaning in where the blossom branch was. The camera
+// tree (models/cherry-tree.js) leaning in where the blossom branch was, with the
+// cat (models/cat.js) asleep on his back in its shade. The camera
 // keeps one angle: it opens on a default view of the whole pond, and zooming in
 // lets you slide the view about. Still to come, one at a time: ducks and
 // ducklings, floating petals, dragonflies, fireflies, the heron and swan, feeding,
 // ripples, time of day, rain.
 //
-// URL options: ?crt=off, ?seed=12.
+// URL options: ?crt=off, ?bloom=off, ?seed=12.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
-const MODEL_FILES = ['koi', 'cherry-tree'];
+const MODEL_FILES = ['koi', 'cherry-tree', 'cat'];
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get('seed')) || 3;
 // The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
@@ -691,6 +692,11 @@ const boulders = [];                           // footprints { x, z, r }, so the
   scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshLambertMaterial({ map: rockTex, vertexColors: true }))));
 }
 
+// where the cat sleeps: on the bank at the foot of the cherry tree, on the side
+// nearer the viewer so the trunk does not hide him. Set here so that the bank grass
+// can keep clear of him.
+const CAT_AT = rim(3.72, 1.22), CAT_SCALE = 0.5, CAT_ROOM = 1.6;
+
 // -------------------------------------------------------------- bank grass
 // tufts all round the rim, thick in the four corners; each is two crossed cards.
 // None grow where a boulder sits, so they come up between the rocks instead.
@@ -713,7 +719,10 @@ tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
   for (const corner of [0.72, 2.45, 3.85, 5.6]) {
     for (let i = 0; i < 55; i++) spots.push([corner + rr(-0.36, 0.36), 1.03 + 0.5 * rand(), rr(0.7, 1.35)]);
   }
-  const clear = spots.filter(([a, k]) => { const at = rim(a, k); return !boulders.some((b) => Math.hypot(b.x - at.x, b.z - at.y) < b.r * 0.85); });
+  const clear = spots.filter(([a, k]) => {
+    const at = rim(a, k);
+    return at.distanceTo(CAT_AT) > CAT_ROOM && !boulders.some((b) => Math.hypot(b.x - at.x, b.z - at.y) < b.r * 0.85);
+  });
   spots.length = 0; spots.push(...clear);
   const card = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
   const tufts = new THREE.InstancedMesh(
@@ -739,6 +748,16 @@ tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
 // pond had a blossoming branch reaching in; its petals fall onto the surface
 const TREE_AT = rim(3.85, 1.2);
 const tree = build('cherry-tree', new THREE.Vector3(TREE_AT.x, 0, TREE_AT.y));
+
+// --------------------------------------------------------------------- cat
+// asleep under the tree. The model lies with its feet toward the viewer and its
+// face tipped up, which suits the pond's high camera as it is. He is far smaller
+// than in the viewer, to sit rightly beside the koi and the trunk.
+const cat = build('cat', new THREE.Vector3(CAT_AT.x, 0, CAT_AT.y));
+if (cat) {
+  cat.holder.scale.setScalar(CAT_SCALE);
+  cat.setVariant('sleep');
+}
 
 // ------------------------------------------------------ camera + controls
 // The camera always looks from the same angle: from the near bank, down across
@@ -790,6 +809,8 @@ const screenMaterial = new THREE.ShaderMaterial({
     tScene: { value: sceneRT.texture },
     uRes: { value: new THREE.Vector2(1, 1) },   // size of the small image
     uCrt: { value: 1 },
+    tBloom: { value: null },                    // the blurred glow, see bloom below
+    uBloom: { value: 0 },                       // how much of it to add; 0 = off
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -799,7 +820,12 @@ const screenMaterial = new THREE.ShaderMaterial({
     uniform sampler2D tScene;
     uniform vec2 uRes;
     uniform float uCrt;
+    uniform sampler2D tBloom;
+    uniform float uBloom;
     varying vec2 vUv;
+
+    // the small image with its glow added
+    vec3 picture(vec2 uv) { return texture2D(tScene, uv).rgb + uBloom * texture2D(tBloom, uv).rgb; }
 
     // bulge the picture like curved glass
     vec2 curve(vec2 uv) {
@@ -812,14 +838,14 @@ const screenMaterial = new THREE.ShaderMaterial({
     // one scanline of the small image, smeared sideways as a tube would
     vec3 row(vec2 px) {
       float x = px.x - 0.5, y = floor(px.y) + 0.5;
-      vec3 a = texture2D(tScene, vec2(floor(x) + 0.5, y) / uRes).rgb;
-      vec3 b = texture2D(tScene, vec2(floor(x) + 1.5, y) / uRes).rgb;
+      vec3 a = picture(vec2(floor(x) + 0.5, y) / uRes);
+      vec3 b = picture(vec2(floor(x) + 1.5, y) / uRes);
       return mix(a, b, fract(x));
     }
     void main() {
       vec3 col;
       if (uCrt < 0.5) {
-        col = texture2D(tScene, vUv).rgb;                // stretched smoothly over the window
+        col = picture(vUv);                              // stretched smoothly over the window
       } else {
         vec2 uv = curve(vUv);
         vec2 px = uv * uRes;
@@ -851,6 +877,78 @@ screenQuad.frustumCulled = false;
 screenScene.add(screenQuad);
 const screenCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
+// ------------------------------------------------------------------- bloom
+// Bright parts of the picture glow, as in PS2 games that drew the frame over itself
+// blurred: whatever in the small image is brighter than BLOOM_THRESHOLD is copied
+// to a quarter-size image, blurred across and then down, and the screen pass adds
+// the result on top. Toggle: the button, the G key, or ?bloom=off in the URL; the
+// choice is remembered.
+const BLOOM_SCALE = 4, BLOOM_THRESHOLD = 0.68, BLOOM_STRENGTH = 0.4;
+const bloomRT = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false,
+}));
+screenMaterial.uniforms.tBloom.value = bloomRT[1].texture;
+const bloomMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    tMap: { value: null },
+    uStep: { value: new THREE.Vector2() },      // from one blur tap to the next
+    uSpread: { value: new THREE.Vector2() },    // each tap is two samples this far either side, to take in every row when shrinking
+    uThreshold: { value: 0 },                   // 0 = keep everything (the second pass)
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tMap;
+    uniform vec2 uStep, uSpread;
+    uniform float uThreshold;
+    varying vec2 vUv;
+    vec3 tap(float i) {
+      vec2 at = vUv + uStep * i;
+      vec3 c = 0.5 * (texture2D(tMap, at + uSpread).rgb + texture2D(tMap, at - uSpread).rgb);
+      float bright = dot(c, vec3(0.299, 0.587, 0.114));   // by eye, so the deep blue sky stays calm
+      return uThreshold > 0.0 ? c * smoothstep(uThreshold, uThreshold + 0.3, bright) : c;
+    }
+    void main() {
+      vec3 sum = tap(0.0) * 0.204;
+      sum += (tap(1.0) + tap(-1.0)) * 0.180;
+      sum += (tap(2.0) + tap(-2.0)) * 0.124;
+      sum += (tap(3.0) + tap(-3.0)) * 0.066;
+      sum += (tap(4.0) + tap(-4.0)) * 0.028;
+      gl_FragColor = vec4(sum, 1.0);
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const bloomScene = new THREE.Scene();
+const bloomQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bloomMaterial);
+bloomQuad.frustumCulled = false;
+bloomScene.add(bloomQuad);
+// call once the scene has been drawn into sceneRT
+function renderBloom() {
+  if (!bloomIsOn()) return;
+  const u = bloomMaterial.uniforms, { width, height } = bloomRT[0];
+  u.tMap.value = sceneRT.texture;
+  u.uStep.value.set(1 / width, 0); u.uSpread.value.set(0, 0.25 / height); u.uThreshold.value = BLOOM_THRESHOLD;
+  renderer.setRenderTarget(bloomRT[0]);
+  renderer.render(bloomScene, screenCamera);
+  u.tMap.value = bloomRT[0].texture;
+  u.uStep.value.set(0, 1 / height); u.uSpread.value.set(0, 0); u.uThreshold.value = 0;
+  renderer.setRenderTarget(bloomRT[1]);
+  renderer.render(bloomScene, screenCamera);
+}
+const bloomButton = document.getElementById('bloom');
+function setBloom(on) {
+  screenMaterial.uniforms.uBloom.value = on ? BLOOM_STRENGTH : 0;
+  bloomButton.textContent = on ? 'BLOOM: on' : 'BLOOM: off';
+  bloomButton.setAttribute('aria-pressed', String(on));
+  remember('cherry-bloom', on ? 'on' : 'off');
+}
+const bloomIsOn = () => screenMaterial.uniforms.uBloom.value > 0;
+setBloom((params.get('bloom') || recall('cherry-bloom')) !== 'off');
+bloomButton.addEventListener('click', () => setBloom(!bloomIsOn()));
+
 // CRT toggle: the button, the C key, or ?crt=off in the URL; the choice is remembered
 const crtButton = document.getElementById('crt');
 function setCrt(on) {
@@ -869,6 +967,7 @@ function resize() {
   // the same pixel width and simply shows more or fewer of them
   const h = RENDER_HEIGHT, w = Math.round(RENDER_WIDTH * aspect / (4 / 3));
   sceneRT.setSize(w, h);
+  for (const rt of bloomRT) rt.setSize(Math.ceil(w / BLOOM_SCALE), Math.ceil(h / BLOOM_SCALE));
   screenMaterial.uniforms.uRes.value.set(w, h);
   shared.uSnap.value.set(w / 2 * SUBPIXEL, h / 2 * SUBPIXEL);
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -890,6 +989,7 @@ addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.toLowerCase();
   if (key === 'c') setCrt(!crtIsOn());
+  if (key === 'g') setBloom(!bloomIsOn());
   if (key === 'r') resetView();
 });
 
@@ -903,6 +1003,7 @@ renderer.setAnimationLoop(() => {
   updateKoi(dt);
   updatePads(time);
   tree?.update?.(dt, time);
+  cat?.update(dt, time);
   caustics[0].offset.set(time * 0.014, time * 0.008);
   caustics[1].offset.set(-time * 0.009, time * 0.012);
   caustics[2].offset.set(time * 0.006, -time * 0.01);
@@ -911,6 +1012,7 @@ renderer.setAnimationLoop(() => {
   sky.position.copy(camera.position);
   renderer.setRenderTarget(sceneRT);
   renderer.render(scene, camera);
+  renderBloom();
   renderer.setRenderTarget(null);
   renderer.render(screenScene, screenCamera);
 });

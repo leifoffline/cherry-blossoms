@@ -46,16 +46,17 @@
 <div class="bar" id="right">
   <button id="env" type="button">BG: outdoors</button>
   <button id="spin" type="button" aria-pressed="false">SPIN: off</button>
+  <button id="bloom" type="button" aria-pressed="true">BLOOM: on</button>
   <button id="crt" type="button" aria-pressed="true">CRT: on</button>
 </div>
-<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · S spin · R reset view · V next variant</div>
+<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · G bloom · S spin · R reset view · V next variant</div>
 <script type="module">
 // Viewing environment for models built with the low-poly renderer from index.html.
 //
 // To add a model: write models/<name>.js (see models/cherry-tree.js for the shape of
 // one) and add <name> to MODEL_FILES below. It then shows up in the picker, and can be
 // opened directly with viewer.html?model=<name>. Other URL options: ?env=room or
-// ?env=outdoors, ?crt=off, ?spin=on, ?seed=12, ?variant=<name>.
+// ?env=outdoors, ?crt=off, ?bloom=off, ?spin=on, ?seed=12, ?variant=<name>.
 //
 // A model that comes in several versions (see models/koi.js) returns `variants`, a
 // list of { name, label }, and `setVariant(name)`; they get a second picker.
@@ -403,6 +404,8 @@ const screenMaterial = new THREE.ShaderMaterial({
     tScene: { value: sceneRT.texture },
     uRes: { value: new THREE.Vector2(1, 1) },   // size of the small image
     uCrt: { value: 1 },
+    tBloom: { value: null },                    // the blurred glow, see bloom below
+    uBloom: { value: 0 },                       // how much of it to add; 0 = off
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -412,7 +415,12 @@ const screenMaterial = new THREE.ShaderMaterial({
     uniform sampler2D tScene;
     uniform vec2 uRes;
     uniform float uCrt;
+    uniform sampler2D tBloom;
+    uniform float uBloom;
     varying vec2 vUv;
+
+    // the small image with its glow added
+    vec3 picture(vec2 uv) { return texture2D(tScene, uv).rgb + uBloom * texture2D(tBloom, uv).rgb; }
 
     // bulge the picture like curved glass
     vec2 curve(vec2 uv) {
@@ -425,14 +433,14 @@ const screenMaterial = new THREE.ShaderMaterial({
     // one scanline of the small image, smeared sideways as a tube would
     vec3 row(vec2 px) {
       float x = px.x - 0.5, y = floor(px.y) + 0.5;
-      vec3 a = texture2D(tScene, vec2(floor(x) + 0.5, y) / uRes).rgb;
-      vec3 b = texture2D(tScene, vec2(floor(x) + 1.5, y) / uRes).rgb;
+      vec3 a = picture(vec2(floor(x) + 0.5, y) / uRes);
+      vec3 b = picture(vec2(floor(x) + 1.5, y) / uRes);
       return mix(a, b, fract(x));
     }
     void main() {
       vec3 col;
       if (uCrt < 0.5) {
-        col = texture2D(tScene, vUv).rgb;                // stretched smoothly over the window
+        col = picture(vUv);                              // stretched smoothly over the window
       } else {
         vec2 uv = curve(vUv);
         vec2 px = uv * uRes;
@@ -464,6 +472,78 @@ screenQuad.frustumCulled = false;
 screenScene.add(screenQuad);
 const screenCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
+// ------------------------------------------------------------------- bloom
+// Bright parts of the picture glow, as in PS2 games that drew the frame over itself
+// blurred: whatever in the small image is brighter than BLOOM_THRESHOLD is copied
+// to a quarter-size image, blurred across and then down, and the screen pass adds
+// the result on top. Toggle: the button, the G key, or ?bloom=off in the URL; the
+// choice is remembered.
+const BLOOM_SCALE = 4, BLOOM_THRESHOLD = 0.68, BLOOM_STRENGTH = 0.4;
+const bloomRT = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false,
+}));
+screenMaterial.uniforms.tBloom.value = bloomRT[1].texture;
+const bloomMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    tMap: { value: null },
+    uStep: { value: new THREE.Vector2() },      // from one blur tap to the next
+    uSpread: { value: new THREE.Vector2() },    // each tap is two samples this far either side, to take in every row when shrinking
+    uThreshold: { value: 0 },                   // 0 = keep everything (the second pass)
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tMap;
+    uniform vec2 uStep, uSpread;
+    uniform float uThreshold;
+    varying vec2 vUv;
+    vec3 tap(float i) {
+      vec2 at = vUv + uStep * i;
+      vec3 c = 0.5 * (texture2D(tMap, at + uSpread).rgb + texture2D(tMap, at - uSpread).rgb);
+      float bright = dot(c, vec3(0.299, 0.587, 0.114));   // by eye, so the deep blue sky stays calm
+      return uThreshold > 0.0 ? c * smoothstep(uThreshold, uThreshold + 0.3, bright) : c;
+    }
+    void main() {
+      vec3 sum = tap(0.0) * 0.204;
+      sum += (tap(1.0) + tap(-1.0)) * 0.180;
+      sum += (tap(2.0) + tap(-2.0)) * 0.124;
+      sum += (tap(3.0) + tap(-3.0)) * 0.066;
+      sum += (tap(4.0) + tap(-4.0)) * 0.028;
+      gl_FragColor = vec4(sum, 1.0);
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const bloomScene = new THREE.Scene();
+const bloomQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bloomMaterial);
+bloomQuad.frustumCulled = false;
+bloomScene.add(bloomQuad);
+// call once the scene has been drawn into sceneRT
+function renderBloom() {
+  if (!bloomIsOn()) return;
+  const u = bloomMaterial.uniforms, { width, height } = bloomRT[0];
+  u.tMap.value = sceneRT.texture;
+  u.uStep.value.set(1 / width, 0); u.uSpread.value.set(0, 0.25 / height); u.uThreshold.value = BLOOM_THRESHOLD;
+  renderer.setRenderTarget(bloomRT[0]);
+  renderer.render(bloomScene, screenCamera);
+  u.tMap.value = bloomRT[0].texture;
+  u.uStep.value.set(0, 1 / height); u.uSpread.value.set(0, 0); u.uThreshold.value = 0;
+  renderer.setRenderTarget(bloomRT[1]);
+  renderer.render(bloomScene, screenCamera);
+}
+const bloomButton = document.getElementById('bloom');
+function setBloom(on) {
+  screenMaterial.uniforms.uBloom.value = on ? BLOOM_STRENGTH : 0;
+  bloomButton.textContent = on ? 'BLOOM: on' : 'BLOOM: off';
+  bloomButton.setAttribute('aria-pressed', String(on));
+  remember('cherry-bloom', on ? 'on' : 'off');
+}
+const bloomIsOn = () => screenMaterial.uniforms.uBloom.value > 0;
+setBloom((params.get('bloom') || recall('cherry-bloom')) !== 'off');
+bloomButton.addEventListener('click', () => setBloom(!bloomIsOn()));
+
 // CRT toggle: the button, the C key, or ?crt=off in the URL; the choice is remembered
 const crtButton = document.getElementById('crt');
 function setCrt(on) {
@@ -482,6 +562,7 @@ function resize() {
   // the same pixel width and simply shows more or fewer of them
   const h = RENDER_HEIGHT, w = Math.round(RENDER_WIDTH * aspect / (4 / 3));
   sceneRT.setSize(w, h);
+  for (const rt of bloomRT) rt.setSize(Math.ceil(w / BLOOM_SCALE), Math.ceil(h / BLOOM_SCALE));
   screenMaterial.uniforms.uRes.value.set(w, h);
   shared.uSnap.value.set(w / 2 * SUBPIXEL, h / 2 * SUBPIXEL);
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -628,6 +709,7 @@ addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.target === picker || e.target === variantPicker) return;
   const key = e.key.toLowerCase();
   if (key === 'c') setCrt(!crtIsOn());
+  if (key === 'g') setBloom(!bloomIsOn());
   if (key === 'b') setEnv(env === 'room' ? 'outdoors' : 'room');
   if (key === 's') setSpin(!controls.autoRotate);
   if (key === 'r') resetView();
@@ -646,6 +728,7 @@ renderer.setAnimationLoop(() => {
   sky.position.copy(camera.position);
   renderer.setRenderTarget(sceneRT);
   renderer.render(scene, camera);
+  renderBloom();
   renderer.setRenderTarget(null);
   renderer.render(screenScene, screenCamera);
 });

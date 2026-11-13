@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A low-poly, PS2-style WebGL scene and model viewer, written as plain HTML and JavaScript on three.js (loaded from a CDN through an import map). There is no build step, package manager, linter or test suite: open the HTML files in a browser, straight from disk (`file://`) or from any static server.
 
 - `index.html`: the standalone cherry blossom scene.
-- `viewer.html`: a viewer for the models in `models/`, with a model picker, outdoor and white-room backdrops, and CRT and spin toggles.
+- `viewer.html`: a viewer for the models in `models/`, with a model picker, outdoor and white-room backdrops, and CRT, bloom and spin toggles.
 - `pond.html`: a koi pond environment, a 3D remake of the ASCII pond in the sibling `ascii_pond` project (`../ascii_pond/index.html`, whose `CLAUDE.md` lists that pond's contents and design rules). It is being built up one feature at a time; the header comment in the file lists what is in and what is still to come.
 
 ## Checking changes
@@ -31,11 +31,12 @@ A low-poly, PS2-style WebGL scene and model viewer, written as plain HTML and Ja
 
 ### Three pages, one renderer, duplicated
 
-`index.html`, `viewer.html` and `pond.html` each contain their own copy of the renderer; they share no code. A change to the look (the vertex-snapping shader, painted textures, palette, sky, grass, CRT filter) has to be made in all three. `models/cherry-tree.js` is likewise a repackaged copy of the tree that `index.html` grows inline.
+`index.html`, `viewer.html` and `pond.html` each contain their own copy of the renderer; they share no code. A change to the look (the vertex-snapping shader, painted textures, palette, sky, grass, bloom, CRT filter) has to be made in all three. `models/cherry-tree.js` is likewise a repackaged copy of the tree that `index.html` grows inline.
 
 The shared look comes from three things:
 
 - **Low-resolution target**: the scene is drawn into a render target at the PS2's 512×448 pixel density (`RENDER_WIDTH` columns per 4:3 of window, `RENDER_HEIGHT` rows, so pixels are a sixth wider than tall; a wider window gets more columns), then a full-window shader pass stretches it over the window, either smoothly (bilinear, the soft PS2 picture) or through the CRT filter. The CRT scanlines fade out when a row is under about three screen pixels tall, to avoid moire.
+- **Bloom**: after the scene is drawn, `renderBloom` copies whatever is brighter than `BLOOM_THRESHOLD` into a quarter-size target, blurs it across and then down, and the screen pass adds it back (`picture()` in the screen shader) at `BLOOM_STRENGTH`. It is on by default and toggled with the BLOOM button, the `G` key or `?bloom=off`, remembered in `localStorage` like the CRT setting.
 - **`psx(material, windAmount)`**: wraps a three.js material, patching its vertex shader through `onBeforeCompile` to snap vertices to a sixteenth of a low-resolution pixel, as the PS2 did (`SUBPIXEL`; 1 gives the PS1 wobble) and, optionally, to apply wind. Every material in the scene should go through it.
 - **`canvasTexture(w, h, paint, options)`**: makes a smoothly filtered texture (bilinear with mipmaps, as on the PS2; `pixelated: true` gives hard PS1 texels) from a small canvas painted in code. Textures cut out with `alphaTest` must pass `cutout: true`, which spreads edge colours under the transparent pixels so filtering does not outline the shapes darkly; those become data textures and cannot be repainted. All textures are generated this way; there are no image assets. Sizes follow PS2 practice: a main object (koi, tree) gets about one 128×128 sheet's worth in total, background and props 64×64 or smaller, and the sky, the largest, is 256×128. The tree's textures draw their layout from the seeded stream in a fixed number and order of draws (changing that regrows the tree) and take fine detail from a fixed `grain` pattern instead.
 
@@ -71,7 +72,7 @@ White surfaces use a dimmed colour plus an emissive term (see the comments in bo
 
 ### The pond
 
-`pond.html` loads the same model files as the viewer (it defines its own `registerModel`) and builds them several times over with its `build(name, at, seed)` helper: five koi, each set to a different variety and steered round the pond by `updateKoi`, and the cherry tree on the bank. Everything else (water, bed, lily pads, reeds, bank grass) is built inline.
+`pond.html` loads the same model files as the viewer (it defines its own `registerModel`) and builds them several times over with its `build(name, at, seed)` helper: five koi, each set to a different variety and steered round the pond by `updateKoi`, the cherry tree on the bank, and the cat asleep at its foot (`CAT_AT`, which the bank grass keeps clear of). Everything else (water, bed, lily pads, reeds, bank grass) is built inline.
 
 - The pond outline is the function `rim(angle, k)`; everything is placed with it, so changing the pond's size or shape there moves the banks, plants and koi with it.
 - Its `psx(material, windAmount, flex)` differs from the other two pages: wind bends a plant about the point `windRoot` held when the material was made (so the tree can stand away from the origin), and `flex` sets the heights between which bending grows (so short plants such as reeds and grass can sway).
@@ -82,7 +83,7 @@ White surfaces use a dimmed colour plus an emissive term (see the comments in bo
 
 ### Viewer URL options
 
-`?model=<name>`, `?variant=<name>`, `?env=room|outdoors`, `?crt=off`, `?spin=on`, `?seed=<n>`. The picker, backdrop, CRT, spin and variant choices are also remembered in `localStorage`.
+`?model=<name>`, `?variant=<name>`, `?env=room|outdoors`, `?crt=off`, `?bloom=off`, `?spin=on`, `?seed=<n>`. The picker, backdrop, CRT, bloom, spin and variant choices are also remembered in `localStorage`.
 
 ## Conventions
 
