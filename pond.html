@@ -34,8 +34,8 @@
 </script>
 </head>
 <body>
-<div class="bar"><button id="bloom" type="button" aria-pressed="true">BLOOM: on</button><button id="crt" type="button" aria-pressed="true">CRT: on</button></div>
-<div id="hint">scroll to zoom in · drag to look around<br>C CRT · G bloom · R default view</div>
+<div class="bar"><button id="time" type="button">TIME: day</button><button id="bloom" type="button" aria-pressed="true">BLOOM: on</button><button id="crt" type="button" aria-pressed="true">CRT: on</button></div>
+<div id="hint">scroll to zoom in · drag to look around<br>T time of day · C CRT · G bloom · R default view</div>
 <script type="module">
 // Koi pond: the ASCII pond from the ascii_pond project, remade in the low-poly
 // renderer. So far: the water and its pebbled floor, five koi (models/koi.js)
@@ -44,11 +44,12 @@
 // tree (models/cherry-tree.js) leaning in where the blossom branch was, with the
 // cat (models/cat.js) asleep on his back in its shade. The camera
 // keeps one angle: it opens on a default view of the whole pond, and zooming in
-// lets you slide the view about. Still to come, one at a time: ducks and
-// ducklings, floating petals, dragonflies, fireflies, the heron and swan, feeding,
-// ripples, time of day, rain.
+// lets you slide the view about. The time of day can be changed; so far there is
+// day and sunset. Still to come, one at a time: ducks and ducklings, floating
+// petals, dragonflies, fireflies, the heron and swan, feeding, ripples, the rest of
+// the day (dusk, night, dawn), rain.
 //
-// URL options: ?crt=off, ?bloom=off, ?seed=12.
+// URL options: ?crt=off, ?bloom=off, ?time=sunset, ?seed=12.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -92,6 +93,8 @@ const PALETTE = {
   reedLow: '#4b8355', reedHigh: '#b8da8f', cattailStalk: '#76a362', cattailHead: '#8a5c3c', cattailSpike: '#c8b684',
   rock: ['#c4c2bc', '#d2d0c9', '#b2b0ac', '#e1ded6'], rockGritDark: '#807e79', rockGritLight: '#e4dfd2', rockCrack: '#72716e',
   rockTints: ['#ffffff', '#f8f2e9', '#f0e8d9', '#e9ecf1', '#f6ecdc', '#e2ddd4'], pebbleTints: ['#ffffff', '#dee0e5'],
+  // sunset (see time of day): a low orange sun, and water that takes on the colour of the sky
+  sunsetSun: 0xff9a52, sunsetWaterDeep: 0x1f4a8c, sunsetWaterSurface: [0xc8708c, 0.24], sunsetCaustics: 0xffcf86, sunsetSky: 0xff9c6a,
 };
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -119,7 +122,8 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 1200);
 
-scene.add(new THREE.HemisphereLight(PALETTE.skyLight, PALETTE.groundLight, 2.6));
+const skyLight = new THREE.HemisphereLight(PALETTE.skyLight, PALETTE.groundLight, 2.6);
+scene.add(skyLight);
 const sun = new THREE.DirectionalLight(PALETTE.sunLight, 2.0);
 sun.position.copy(SUN_DIR).multiplyScalar(50);
 scene.add(sun);
@@ -254,7 +258,10 @@ skyTex.wrapT = THREE.ClampToEdgeWrapping;
 // out it is from the trunk; `flex` is [height where bending starts, height where it
 // is full, extra bend per unit out from the root]. The root is wherever
 // `windRoot` was pointing when the material was made.
-const shared = { uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) } };
+const shared = {
+  uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) },
+  uDayLight: { value: new THREE.Color(1, 1, 1) }, uDayShade: { value: new THREE.Color(1, 1, 1) },   // see graded()
+};
 const windRoot = new THREE.Vector3();
 const TREE_FLEX = [2.2, 9, 0.03];
 const PSX_GLSL = /* glsl */`
@@ -285,6 +292,20 @@ const PSX_PROJECT_GLSL = /* glsl */`
   gl_Position = projectionMatrix * mvPosition;
   gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;
 `;
+// The colour of the hour (see time of day) is laid over every material as it is
+// drawn, since much of the scene is unlit and would not answer to the lamps: bright
+// parts are multiplied by one colour and dark parts by another, so a sunset can
+// have orange light and violet shade. psx() applies it; a material that does not go
+// through psx() can be given it alone.
+function graded(shader) {
+  shader.uniforms.uDayLight = shared.uDayLight;
+  shader.uniforms.uDayShade = shared.uDayShade;
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nuniform vec3 uDayLight;\nuniform vec3 uDayShade;')
+    .replace('#include <tonemapping_fragment>', /* glsl */`
+      gl_FragColor.rgb *= mix(uDayShade, uDayLight, smoothstep(0.0, 0.4, dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114))));
+      #include <tonemapping_fragment>`);
+}
 function psx(material, windAmount = 0, flex = TREE_FLEX) {
   const uniforms = {
     uWind: { value: windAmount * MOTION },
@@ -295,6 +316,7 @@ function psx(material, windAmount = 0, flex = TREE_FLEX) {
     shader.uniforms.uTime = shared.uTime;
     shader.uniforms.uSnap = shared.uSnap;
     Object.assign(shader.uniforms, uniforms);
+    graded(shader);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + PSX_GLSL)
       .replace('#include <project_vertex>', PSX_PROJECT_GLSL);
@@ -469,6 +491,15 @@ function build(name, at, seed = SEED) {
       rand: mulberry32(seed), seed, sunDir: SUN_DIR, windDir: WIND_DIR,
     });
     const model = built.isObject3D ? { object: built } : built;
+    // the few materials a model leaves out of psx() (loose petals, the cat's Zs) still take the colour of the hour
+    model.object.traverse((o) => {
+      for (const m of [].concat(o.material || [])) {
+        if (!m.onBeforeCompile || m.onBeforeCompile === THREE.Material.prototype.onBeforeCompile) {
+          m.onBeforeCompile = graded;
+          m.customProgramCacheKey = () => 'graded';
+        }
+      }
+    });
     const holder = new THREE.Group();
     holder.position.copy(at);
     holder.add(model.object);
@@ -759,6 +790,70 @@ if (cat) {
   cat.setVariant('sleep');
 }
 
+// ------------------------------------------------------------- time of day
+// Each time of day is a set of values for the lamps, the colour laid over the
+// picture (see graded) and the water; changing the time eases every value from
+// where it is now to the new set. So far: day and sunset.
+//
+// The ground is lit and the grass standing on it is not, so the light falling on
+// level ground is kept the same at every hour (the sky lamp makes up what a low sun
+// loses) and the hour's colour comes from the grade alone. What the sun's height
+// and colour change is the sides of things: rocks, the cat, the koi.
+const SUN_ON_GROUND = 2.6 + 2.0 * SUN_DIR.y;
+const litAs = (dir, sunPower) => ({ sunDir: dir.normalize(), sunPower, skyPower: SUN_ON_GROUND - sunPower * dir.y });
+const TIMES = {
+  day: {
+    ...litAs(SUN_DIR.clone(), 2.0), sunColor: new THREE.Color(PALETTE.sunLight),
+    gradeLight: new THREE.Color(1, 1, 1), gradeShade: new THREE.Color(1, 1, 1),
+    waterDeep: new THREE.Color(PALETTE.waterDeep[0]),
+    waterSurface: new THREE.Color(PALETTE.waterSurface[0]), waterSurfaceOpacity: PALETTE.waterSurface[1],
+    caustics: new THREE.Color(1, 1, 1), sky: new THREE.Color(1, 1, 1),
+  },
+  // the sun low on the left, behind the tree: orange light, violet shade, and the
+  // water going the rose of the sky with its web of light turned gold
+  sunset: {
+    ...litAs(new THREE.Vector3(-0.85, 0.22, -0.45), 3.4), sunColor: new THREE.Color(PALETTE.sunsetSun),
+    gradeLight: new THREE.Color(1.08, 0.8, 0.6), gradeShade: new THREE.Color(0.55, 0.42, 0.68),
+    waterDeep: new THREE.Color(PALETTE.sunsetWaterDeep),
+    waterSurface: new THREE.Color(PALETTE.sunsetWaterSurface[0]), waterSurfaceOpacity: PALETTE.sunsetWaterSurface[1],
+    caustics: new THREE.Color(PALETTE.sunsetCaustics).multiplyScalar(1.7), sky: new THREE.Color(PALETTE.sunsetSky),
+  },
+};
+const TIME_NAMES = Object.keys(TIMES), TIME_EASE = 0.7;          // TIME_EASE: the change takes about five seconds
+let timeOfDay = 'day';
+const hour = Object.fromEntries(Object.entries(TIMES.day).map(([k, v]) => [k, v.clone ? v.clone() : v]));   // the values in force now
+const causticBase = [PALETTE.causticBed, ...PALETTE.caustics].map(([color]) => new THREE.Color(color));
+const causticSheets = [waterLayers[0], waterLayers[3], waterLayers[4]].map((layer) => layer.material);
+function updateTimeOfDay(dt, at = 1 - Math.exp(-dt * TIME_EASE)) {
+  const to = TIMES[timeOfDay];
+  for (const k in hour) {
+    if (typeof hour[k] === 'number') hour[k] += (to[k] - hour[k]) * at;
+    else hour[k].lerp(to[k], at);
+  }
+  sun.position.copy(hour.sunDir).normalize().multiplyScalar(50);
+  sun.color.copy(hour.sunColor);
+  sun.intensity = hour.sunPower;
+  skyLight.intensity = hour.skyPower;
+  shared.uDayLight.value.copy(hour.gradeLight);
+  shared.uDayShade.value.copy(hour.gradeShade);
+  waterLayers[1].material.color.copy(hour.waterDeep);
+  waterLayers[2].material.color.copy(hour.waterSurface);
+  waterLayers[2].material.opacity = hour.waterSurfaceOpacity;
+  causticSheets.forEach((material, i) => material.color.copy(causticBase[i]).multiply(hour.caustics));
+  sky.material.color.copy(hour.sky);
+}
+// the TIME button, the T key, or ?time=sunset in the URL; the choice is remembered
+const timeButton = document.getElementById('time');
+function setTimeOfDay(name, atOnce = false) {
+  timeOfDay = TIMES[name] ? name : 'day';
+  timeButton.textContent = `TIME: ${timeOfDay}`;
+  remember('pond-time', timeOfDay);
+  if (atOnce) updateTimeOfDay(0, 1);
+}
+const nextTimeOfDay = () => setTimeOfDay(TIME_NAMES[(TIME_NAMES.indexOf(timeOfDay) + 1) % TIME_NAMES.length]);
+setTimeOfDay(params.get('time') || recall('pond-time'), true);
+timeButton.addEventListener('click', nextTimeOfDay);
+
 // ------------------------------------------------------ camera + controls
 // The camera always looks from the same angle: from the near bank, down across
 // the water. The default view stands far enough back to take in the whole pond
@@ -990,6 +1085,7 @@ addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
   if (key === 'c') setCrt(!crtIsOn());
   if (key === 'g') setBloom(!bloomIsOn());
+  if (key === 't') nextTimeOfDay();
   if (key === 'r') resetView();
 });
 
@@ -1004,6 +1100,7 @@ renderer.setAnimationLoop(() => {
   updatePads(time);
   tree?.update?.(dt, time);
   cat?.update(dt, time);
+  updateTimeOfDay(dt);
   caustics[0].offset.set(time * 0.014, time * 0.008);
   caustics[1].offset.set(-time * 0.009, time * 0.012);
   caustics[2].offset.set(time * 0.006, -time * 0.01);
