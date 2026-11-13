@@ -305,7 +305,9 @@ registerModel({
     // propped up, chin toward the chest, which also shows the viewer his face.
     // HEAD_DROP then lets it down until the back of the head (taken as the plain
     // ellipsoid) touches the floor; the neck joint is hidden inside the head anyway.
-    const HEAD_PROP = 0.85;
+    // It is also pushed a little way off the shoulders, and not propped too steeply,
+    // so that the chin clears the arms folded on the chest.
+    const HEAD_PROP = 0.7, HEAD_OUT = 0.1;
     const HEAD_DROP = BED.y + (NECK.y - HIPS.y) * Math.sin(LEAN) + (HEAD.y - NECK.y) * Math.sin(HEAD_PROP + LEAN)
       - Math.hypot(HB * Math.sin(HEAD_PROP + LEAN), HC * Math.cos(HEAD_PROP + LEAN));
     // The tail's curl lies nearly in one plane (TAIL_PLANE is its normal). Laying that
@@ -329,16 +331,19 @@ registerModel({
 
       // head: propped on its own back, lolling a little to one side
       head.position.copy(head.userData.rest).z -= HEAD_DROP;
+      head.position.y += HEAD_OUT;
       head.rotation.set(HEAD_PROP + 0.012 * breath, 0, 0.08);
 
       // arms crossed on his chest: each upper arm comes forward round the ribs and the
-      // forearm lies across to the far side, his left over his right; they ride on his
-      // breathing. Directions are in the torso's own frame.
+      // forearm lies across to the far side, his left sloping down over his right as
+      // it slopes up, so they make an X; they ride on his breathing. They sit low on
+      // the chest, where the chin does not reach. Directions are in the torso's own
+      // frame.
       for (const arm of arms) {
         const over = arm.side === CROSS;
         arm.upper.position.copy(arm.upper.userData.rest).z += 0.025 * breath;
-        arm.upper.quaternion.setFromUnitVectors(arm.along, reach.set(arm.side * 0.14, over ? -0.26 : -0.4, over ? 0.6 : 0.5).normalize());
-        reach.set(-arm.side * 0.95, over ? 0.02 : 0.1, over ? 0.2 : 0.12).normalize();
+        arm.upper.quaternion.setFromUnitVectors(arm.along, reach.set(arm.side * 0.14, over ? -0.35 : -0.56, over ? 0.5 : 0.34).normalize());
+        reach.set(-arm.side * 0.95, over ? -0.22 : 0.08, over ? 0.2 : 0.38).normalize();
         arm.fore.quaternion.setFromUnitVectors(arm.along, reach.applyQuaternion(q.copy(arm.upper.quaternion).invert()));
         arm.paw.rotation.set(0, 0, 0);
       }
