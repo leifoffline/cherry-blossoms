@@ -222,6 +222,7 @@ registerModel({
     // into the head nor lifts off it.
     const EAR_TILT = 0.5, EAR_TURN = 0.3;        // lean outward, and how far the hollow faces outward
     const EAR_H = 1.3, EAR_W = 0.74, EAR_D = 0.5; // height, half width at the base, and how far the back swells
+    const EAR_ROOT = 0.55;                       // how far the shell carries on into the head
     const EAR_AT = V(1.5, 5.0, 0);               // middle of the ear on his left
     const earBase = (side) => V(side * (EAR_AT.x - Math.sin(EAR_TILT) * EAR_H / 2), EAR_AT.y - Math.cos(EAR_TILT) * EAR_H / 2, 0);
     const earWidth = (v) => EAR_W * (1 - v ** 1.3) ** 0.75;       // half width, from base (v = 0) to tip
@@ -244,10 +245,13 @@ registerModel({
     const ears = SIDES.map((side) => piece(head, earBase(side), () => {
       const base = earBase(side);
       const place = (g) => g.rotateY(side * EAR_TURN).rotateZ(-side * EAR_TILT).translate(base.x, base.y, base.z);
-      // the shell: rings running round the back (a half ellipse) and across the hollow front
-      white.push(place(sheet(20, 10, true, (a, v) => {
+      // the shell: rings running round the back (a half ellipse) and across the hollow
+      // front. It carries on below its base as a root of the same section, buried in
+      // the head, so that when the ear folds over no open edge lifts clear of the skull.
+      white.push(place(sheet(20, 13, true, (a, t) => {
         const u = Math.sin(a * Math.PI * 2), c = Math.cos(a * Math.PI * 2);
-        return [earWidth(v) * u, v * EAR_H, c < 0 ? earDepth(v) * c : earHollow(u, v)];
+        const y = t * (EAR_H + EAR_ROOT) - EAR_ROOT, v = Math.max(0, y / EAR_H);
+        return [earWidth(v) * u, y, c < 0 ? earDepth(v) * c : earHollow(u, v)];
       })));
       // the pink lining: a smaller ear shape lying just proud of the hollow
       pink.push(place(sheet(6, 6, false, (s, t) => {
@@ -414,7 +418,7 @@ registerModel({
     // hollows face the floor and the backs show on top. They ease from one to the
     // other, and slide a little way out of the head as they fold so that the whole
     // ear still shows.
-    const EAR_FOLD = 1.1, EAR_ROLL = 0.8, EAR_SLIDE = V(0.3, -0.12, 0), EAR_EASE = 7;
+    const EAR_FOLD = 1.1, EAR_ROLL = 0.8, EAR_SLIDE = V(0.32, -0.3, 0), EAR_EASE = 7;
     const earAxis = SIDES.map((side) => V(side * Math.sin(EAR_TILT), Math.cos(EAR_TILT), 0));
     const fold = new THREE.Quaternion(), roll = new THREE.Quaternion();
     let earDown = 0;
