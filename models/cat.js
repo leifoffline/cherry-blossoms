@@ -138,14 +138,16 @@ registerModel({
 
     // ------------------------------------------------------------------ head
     // The head is an ellipsoid pushed out where a cat's face is full: a muzzle around
-    // the nose and mouth, and a cheek low on each side. `u` is a direction from the
+    // the nose and mouth, a soft whisker pad sitting in the bowl of each half of the
+    // mouth (with a crease between them under the nose), and a cheek low on each side. `u` is a direction from the
     // head's centre; the same function shapes the mesh and places the face on it.
     const smooth = THREE.MathUtils.smoothstep;
     const CHEEK = V(0.72, -0.4, 0.57).normalize();
     function headPoint(u, lift = 0) {
       const muzzle = Math.exp(-((u.x / 0.42) ** 2 + ((u.y + 0.22) / 0.4) ** 2)) * smooth(u.z, 0, 0.4);
       const cheek = (side) => Math.exp(-((u.x - side * CHEEK.x) ** 2 + (u.y - CHEEK.y) ** 2 + (u.z - CHEEK.z) ** 2) / 0.42 ** 2);
-      const puff = 0.3 * muzzle + 0.22 * (cheek(-1) + cheek(1));
+      const pad = (side) => Math.exp(-(((u.x - side * 0.22) / 0.17) ** 2 + ((u.y + 0.2) / 0.19) ** 2)) * smooth(u.z, 0, 0.4);
+      const puff = 0.2 * muzzle + 0.2 * (pad(-1) + pad(1)) + 0.22 * (cheek(-1) + cheek(1));
       const outward = V(u.x / HA, u.y / HB, u.z / HC).normalize();
       return V(u.x * HA, u.y * HB, u.z * HC).addScaledVector(outward, puff + lift).add(HEAD);
     }
@@ -159,9 +161,14 @@ registerModel({
     const stroke = (points) => new THREE.TubeGeometry(
       new THREE.CatmullRomCurve3(points.map(([x, y]) => onFace(x, y))), points.length * 8, LINE, 8, false);
 
+    const dab = (x, y) => {                      // a round blot, for line ends and joins
+      const at = onFace(x, y);
+      return new THREE.SphereGeometry(LINE * 1.05, 8, 6).translate(at.x, at.y, at.z);
+    };
+
     let eyesOpen, eyesClosed;
     const head = piece(torso, NECK, (solid) => {
-      const g = new THREE.SphereGeometry(1, 40, 28);
+      const g = new THREE.SphereGeometry(1, 72, 48);   // fine enough to hold the whisker pads
       const p = g.attributes.position, u = V();
       for (let i = 0; i < p.count; i++) {
         const q = headPoint(u.fromBufferAttribute(p, i).normalize());
@@ -183,9 +190,12 @@ registerModel({
         for (let u = -1; u <= 1.001; u += 0.5) lid.push([side * (EYE_X + u * 0.23), EYE_Y - 0.03 + 0.06 * u * u]);
         closed.push(stroke(lid));
 
-        // one half of the mouth, from under the nose out to the cheek
-        fixed.push(stroke([[0, -0.1], [side * 0.25, -0.42], [side * 0.62, -0.62], [side * 1.02, -0.48], [side * 1.38, -0.2]]));
+        // one half of the mouth, from under the nose out toward the cheek
+        fixed.push(stroke([[0, -0.12], [side * 0.19, -0.36], [side * 0.465, -0.51], [side * 0.765, -0.405], [side * 1.035, -0.195]]));
+        fixed.push(dab(side * 1.035, -0.195));
       }
+      // a short line joins the nose to the mouth, with a dab where the three lines meet
+      fixed.push(stroke([[0, -0.04], [0, -0.08], [0, -0.12]]), dab(0, -0.12));
       const nose = new THREE.ConeGeometry(0.16, 0.2, 3).rotateX(Math.PI).scale(1, 1, 0.5);
       const at = onFace(0, 0.02);
       fixed.push(nose.translate(at.x, at.y, at.z));
