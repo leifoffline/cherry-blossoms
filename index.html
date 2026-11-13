@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cherry Blossom · ASCII</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
+    font: 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    letter-spacing: 0.12em; color: #d9a3c4; opacity: 0.7;
+    pointer-events: none; transition: opacity 2s;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hint">drag to orbit · scroll to zoom</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---------------------------------------------------------------- settings
+const SEED = Number(new URLSearchParams(location.search).get('seed')) || 3; // or add ?seed=12 to the URL
+const CELL_W = 5, CELL_H = 9;   // character cell size in CSS pixels
+const GLYPHS = " .':;!+*oxXO%#8@";   // dark -> bright
+const BLOOM = { strength: 0.35, radius: 0.25, threshold: 0.15 };
+const PETAL_COUNT = 260;
+const PALETTE = {
+  bark: 0xa67c66,
+  blossoms: [0xffe9f1, 0xffd3e2, 0xfbb9cf, 0xf29dbd, 0xd4688f], // pale petals -> deep centres
+  petal: 0xe3a7bf,
+  ground: 0x9c5f7c,
+};
+const WIND_DIR = new THREE.Vector3(1, 0, 0.35).normalize();
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = reducedMotion ? 0.35 : 1;
+
+// ------------------------------------------------------------- seeded RNG
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(SEED);
+const rr = (a, b) => a + (b - a) * rand();
+const randomUnit = () =>
+  new THREE.Vector3(rr(-1, 1), rr(-1, 1), rr(-1, 1)).normalize();
+
+// ------------------------------------------------------------ scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setClearColor(0x000000, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x000000, 8, 24);
+
+const TARGET = new THREE.Vector3(0, 3.4, 0); // re-centred on the canopy once the tree is grown
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+
+scene.add(new THREE.HemisphereLight(0xfff4f0, 0x2a1a18, 1.0));
+const key = new THREE.DirectionalLight(0xffffff, 2.8);
+scene.add(key, key.target); // the key light follows the camera (see the loop) so every side reads well
+
+// -------------------------------------------------------------- wind sway
+// One displacement function shared by bark and blossoms, so they move together.
+const wind = { uTime: { value: 0 }, uWind: { value: MOTION } };
+const WIND_GLSL = /* glsl */`
+  uniform float uTime;
+  uniform float uWind;
+  vec3 windOffset(vec3 p) {
+    float flex = smoothstep(2.2, 9.0, p.y) * 0.75 + 0.05 * length(p.xz);
+    float gust = 0.3
+      + 0.6 * sin(uTime * 0.9 + p.x * 0.35 + p.z * 0.25)
+      + 0.25 * sin(uTime * 2.3 + p.x * 1.3 + p.y * 0.9);
+    vec3 dir = normalize(vec3(1.0, 0.0, 0.35));
+    vec3 o = dir * flex * gust * 0.3;
+    o.y += sin(uTime * 3.1 + p.x * 2.0 + p.z * 2.0) * 0.03 * flex;
+    return o * uWind;
+  }
+`;
+const WIND_PROJECT_GLSL = /* glsl */`
+  vec4 wPos = vec4(transformed, 1.0);
+  #ifdef USE_INSTANCING
+    wPos = instanceMatrix * wPos;
+  #endif
+  wPos = modelMatrix * wPos;
+  wPos.xyz += windOffset(wPos.xyz);
+  vec4 mvPosition = viewMatrix * wPos;
+  gl_Position = projectionMatrix * mvPosition;
+`;
+function applyWind(material) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = wind.uTime;
+    shader.uniforms.uWind = wind.uWind;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + WIND_GLSL)
+      .replace('#include <project_vertex>', WIND_PROJECT_GLSL);
+  };
+  return material;
+}
+
+// ------------------------------------------------------------------- tree
+// A straight trunk that forks into a few rising limbs (vase shape), long slender
+// branches with side shoots, and small tufts of blossom along every twig.
+const MAX_DEPTH = 7;
+const BLOSSOM_FROM = 6;
+const MIN_R = 0.011;
+const UP = new THREE.Vector3(0, 1, 0);
+const segments = [];
+const blossoms = []; // { p: Vector3, s: size, lift: -1..1 height within its tuft }
+
+function addSegment(a, b, ra, rb) {
+  const d = new THREE.Vector3().subVectors(b, a);
+  const len = d.length();
+  const g = new THREE.CylinderGeometry(rb, ra, len, ra > 0.05 ? 7 : 4, 1, true);
+  g.translate(0, len / 2, 0);
+  g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, d.normalize()));
+  g.translate(a.x, a.y, a.z);
+  segments.push(g);
+}
+
+function addTuft(p, count) {
+  const c = p.clone().addScaledVector(randomUnit(), rr(0, 0.07));
+  for (let i = 0; i < count; i++) {
+    const o = randomUnit().multiplyScalar(rr(0.02, 0.12));
+    blossoms.push({ p: c.clone().add(o), s: rr(0.035, 0.07), lift: o.y / 0.12 });
+  }
+}
+
+function grow(start, dir, length, radius, depth) {
+  const steps = depth === 0 ? 5 : 3;
+  const endR = Math.max(radius * (depth === 0 ? 0.8 : 0.72), MIN_R);
+  const p = start.clone();
+  const d = dir.clone();
+  for (let i = 0; i < steps; i++) {
+    d.addScaledVector(randomUnit(), depth === 0 ? 0.06 : 0.2);  // gnarl
+    if (depth >= 1 && depth <= 4) d.y += 0.07;                  // limbs reach upward
+    if (depth >= 6) d.y -= 0.05;                                // tips arch over
+    d.normalize();
+    const q = p.clone().addScaledVector(d, length / steps);
+    let ra = THREE.MathUtils.lerp(radius, endR, i / steps);
+    const rb = THREE.MathUtils.lerp(radius, endR, (i + 1) / steps);
+    if (depth === 0 && i === 0) ra *= 1.45;                     // root flare
+    addSegment(p, q, ra, rb);
+    p.copy(q);
+    if (depth >= BLOSSOM_FROM) addTuft(p, depth === BLOSSOM_FROM ? 2 : 3);
+    // side shoot partway along the branch
+    if (depth >= 2 && depth <= 5 && i < steps - 1 && rand() < 0.28) {
+      const axis = new THREE.Vector3().crossVectors(d, randomUnit()).normalize();
+      const sd = d.clone().applyAxisAngle(axis, rr(0.6, 1.1));
+      sd.y += 0.15;
+      grow(p, sd.normalize(), length * rr(0.45, 0.65), Math.max(rb * 0.5, MIN_R), Math.min(depth + 2, MAX_DEPTH));
+    }
+  }
+  if (depth === MAX_DEPTH) { addTuft(p, 4); return; }
+
+  const n = depth === 0 ? 5 : (rand() < (depth < 3 ? 0.5 : 0.3) ? 3 : 2);
+  const base = new THREE.Vector3().crossVectors(d, randomUnit()).normalize();
+  for (let k = 0; k < n; k++) {
+    const axis = base.clone().applyAxisAngle(d, (k / n) * Math.PI * 2 + rr(-0.45, 0.45));
+    const cd = d.clone().applyAxisAngle(axis, depth === 0 ? rr(0.55, 0.95) : rr(0.35, 0.8));
+    cd.y = Math.max(cd.y, depth < 5 ? 0.15 : -0.3);
+    cd.normalize();
+    const childLen = depth === 0 ? rr(1.7, 2.1) : length * rr(0.76, 0.9);
+    grow(p, cd, childLen, Math.max(endR * rr(0.62, 0.75), MIN_R), depth + 1);
+  }
+}
+grow(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0.05, 1, 0.02).normalize(), 2.6, 0.26, 0);
+
+// centre the view on the canopy and measure it, so the camera can frame any seed
+const bounds = new THREE.Box3().setFromPoints(blossoms.map((b) => b.p));
+const treeTop = bounds.max.y + 0.3;
+TARGET.set((bounds.min.x + bounds.max.x) / 2, treeTop / 2, (bounds.min.z + bounds.max.z) / 2);
+const treeRadius = 0.3 + blossoms.reduce((m, b) => Math.max(m, Math.hypot(b.p.x - TARGET.x, b.p.z - TARGET.z)), 0);
+const canopyCentre = bounds.getCenter(new THREE.Vector3());
+const canopyRadius = bounds.getSize(new THREE.Vector3()).length() / 2;
+
+const bark = new THREE.Mesh(
+  mergeGeometries(segments),
+  applyWind(new THREE.MeshLambertMaterial({ color: PALETTE.bark }))
+);
+scene.add(bark);
+segments.forEach((g) => g.dispose());
+
+// blossoms
+const dummy = new THREE.Object3D();
+const tmpColor = new THREE.Color();
+const blossomColors = PALETTE.blossoms.map((c) => new THREE.Color(c));
+const blossomMesh = new THREE.InstancedMesh(
+  new THREE.OctahedronGeometry(1, 0),
+  applyWind(new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true })),
+  blossoms.length
+);
+blossoms.forEach((b, i) => {
+  dummy.position.copy(b.p);
+  dummy.rotation.set(rr(0, 6.28), rr(0, 6.28), rr(0, 6.28));
+  dummy.scale.setScalar(b.s);
+  dummy.updateMatrix();
+  blossomMesh.setMatrixAt(i, dummy.matrix);
+  // shading baked into colour: the canopy's interior and the underside of each tuft are darker
+  const edge = THREE.MathUtils.smoothstep(b.p.distanceTo(canopyCentre) / canopyRadius, 0.2, 0.8);
+  const shade = THREE.MathUtils.lerp(0.68, 1, edge) * (0.82 + 0.18 * b.lift) * rr(0.85, 1.1);
+  const idx = rand() < 0.06 ? 4 : Math.floor(Math.pow(rand(), 1.6) * 4);
+  tmpColor.copy(blossomColors[idx]).multiplyScalar(shade);
+  blossomMesh.setColorAt(i, tmpColor);
+});
+blossomMesh.frustumCulled = false;
+scene.add(blossomMesh);
+
+// petals already on the ground
+{
+  const N = 1200;
+  const ground = new THREE.InstancedMesh(
+    new THREE.PlaneGeometry(0.1, 0.08),
+    new THREE.MeshBasicMaterial({ color: PALETTE.ground, side: THREE.DoubleSide }),
+    N
+  );
+  for (let i = 0; i < N; i++) {
+    const r = Math.pow(rand(), 0.7) * treeRadius * 1.15, a = rr(0, Math.PI * 2);
+    dummy.position.set(TARGET.x + Math.cos(a) * r + WIND_DIR.x * 0.8, 0.01, TARGET.z + Math.sin(a) * r + WIND_DIR.z * 0.8);
+    dummy.rotation.set(-Math.PI / 2, 0, rr(0, 6.28));
+    dummy.scale.setScalar(rr(0.7, 1.4));
+    dummy.updateMatrix();
+    ground.setMatrixAt(i, dummy.matrix);
+    ground.setColorAt(i, tmpColor.setScalar(rr(0.45, 1.3)));
+  }
+  scene.add(ground);
+}
+
+// ---------------------------------------------------------- falling petals
+const petalMesh = new THREE.InstancedMesh(
+  new THREE.PlaneGeometry(0.07, 0.055),
+  new THREE.MeshBasicMaterial({ color: PALETTE.petal, side: THREE.DoubleSide }),
+  PETAL_COUNT
+);
+petalMesh.frustumCulled = false;
+scene.add(petalMesh);
+
+const R = (a, b) => a + (b - a) * Math.random();
+const petals = Array.from({ length: PETAL_COUNT }, () => ({
+  pos: new THREE.Vector3(), rot: new THREE.Euler(), spin: new THREE.Vector3(),
+  vy: 0, phase: 0, delay: 0, rest: 0, landed: false,
+}));
+function respawn(p, first) {
+  p.pos.copy(blossoms[(Math.random() * blossoms.length) | 0].p);
+  p.rot.set(R(0, 6.28), R(0, 6.28), R(0, 6.28));
+  p.spin.set(R(-3, 3), R(-3, 3), R(-3, 3));
+  p.vy = R(0.45, 0.95);
+  p.phase = R(0, 6.28);
+  p.delay = first ? R(0, 10) : R(0, 3);
+  p.landed = false;
+}
+petals.forEach((p) => respawn(p, true));
+
+function updatePetals(dt, t) {
+  for (let i = 0; i < PETAL_COUNT; i++) {
+    const p = petals[i];
+    let visible = true;
+    if (p.delay > 0) {
+      p.delay -= dt; visible = false;
+    } else if (p.landed) {
+      p.rest -= dt;
+      if (p.rest <= 0) { respawn(p, false); visible = false; }
+    } else {
+      const gust = 0.5 + 0.5 * Math.sin(t * 0.9 + p.pos.x * 0.35 + p.pos.z * 0.25);
+      const drift = 0.12 + 0.4 * gust;
+      p.pos.x += (WIND_DIR.x * drift + Math.sin(t * 2.1 + p.phase) * 0.3) * dt;
+      p.pos.z += (WIND_DIR.z * drift + Math.cos(t * 1.7 + p.phase) * 0.3) * dt;
+      p.pos.y -= p.vy * (0.75 + 0.25 * Math.sin(t * 3.0 + p.phase)) * dt;
+      p.rot.x += p.spin.x * dt; p.rot.y += p.spin.y * dt; p.rot.z += p.spin.z * dt;
+      if (p.pos.y <= 0.02) {
+        p.pos.y = 0.02; p.landed = true; p.rest = R(4, 10);
+        p.rot.set(-Math.PI / 2, 0, R(0, 6.28));
+      }
+    }
+    dummy.position.copy(p.pos);
+    dummy.rotation.copy(p.rot);
+    dummy.scale.setScalar(visible ? 1 : 0);
+    dummy.updateMatrix();
+    petalMesh.setMatrixAt(i, dummy.matrix);
+  }
+  petalMesh.instanceMatrix.needsUpdate = true;
+}
+// run the petals forward a little so some are already in the air on load
+for (let t = 0; t < 12; t += 0.05) updatePetals(0.05, t);
+
+// ------------------------------------------------------------- ASCII pass
+// The scene is rendered into a tiny target with one pixel per character cell;
+// the shader then swaps each cell for a glyph chosen by brightness.
+const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+  type: THREE.HalfFloatType, samples: 4,
+});
+
+function makeGlyphAtlas(dpr) {
+  const cw = Math.round(CELL_W * dpr * 2), ch = Math.round(CELL_H * dpr * 2);
+  const c = document.createElement('canvas');
+  c.width = cw * GLYPHS.length; c.height = ch;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.round(ch * 0.82)}px ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (let i = 0; i < GLYPHS.length; i++) ctx.fillText(GLYPHS[i], (i + 0.5) * cw, ch * 0.52);
+  const tex = new THREE.CanvasTexture(c);
+  tex.generateMipmaps = false;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+const AsciiShader = {
+  uniforms: {
+    tScene: { value: null },
+    tGlyphs: { value: null },
+    uGrid: { value: new THREE.Vector2(1, 1) },
+    uGlyphCount: { value: GLYPHS.length },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene;
+    uniform sampler2D tGlyphs;
+    uniform vec2 uGrid;
+    uniform float uGlyphCount;
+    varying vec2 vUv;
+    void main() {
+      vec2 g = vUv * uGrid;
+      vec2 cell = floor(g);
+      vec2 f = fract(g);
+      vec3 c = texture2D(tScene, (cell + 0.5) / uGrid).rgb;
+      float lum = max(c.r, max(c.g, c.b));
+      float t = clamp(lum, 0.0, 1.0);
+      if (t < 0.02) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+      float idx = max(1.0, floor(pow(t, 0.6) * (uGlyphCount - 1.0) + 0.5));
+      float mask = texture2D(tGlyphs, vec2((idx + f.x) / uGlyphCount, f.y)).r;
+      vec3 hue = pow(c / lum, vec3(1.5)); // deepen colour so pale pinks don't wash out to white
+      gl_FragColor = vec4(hue * mix(0.4, 1.0, t) * mask, 1.0);
+    }
+  `,
+};
+
+const composer = new EffectComposer(renderer);
+const asciiPass = new ShaderPass(AsciiShader);
+asciiPass.uniforms.tScene.value = sceneRT.texture;
+composer.addPass(asciiPass);
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), BLOOM.strength, BLOOM.radius, BLOOM.threshold);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+// ------------------------------------------------------ camera + controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(TARGET);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.minDistance = 5;
+controls.minPolarAngle = 0.35;
+controls.maxPolarAngle = Math.PI / 2 - 0.03;
+controls.autoRotate = !reducedMotion;
+controls.autoRotateSpeed = 0.7;
+
+let glyphDpr = 0;
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, h);
+  composer.setPixelRatio(dpr);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+
+  const cols = Math.max(1, Math.floor(w / CELL_W)), rows = Math.max(1, Math.floor(h / CELL_H));
+  sceneRT.setSize(cols, rows);
+  asciiPass.uniforms.uGrid.value.set(cols, rows);
+  if (dpr !== glyphDpr) {
+    asciiPass.uniforms.tGlyphs.value?.dispose();
+    asciiPass.uniforms.tGlyphs.value = makeGlyphAtlas(dpr);
+    glyphDpr = dpr;
+  }
+}
+resize();
+addEventListener('resize', resize);
+
+// start far enough back that the whole tree fits, in portrait or landscape
+{
+  const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const fit = Math.max((treeTop / 2) / tanV, treeRadius / (tanV * camera.aspect));
+  const dist = fit * 1.02 + treeRadius * 0.4;
+  camera.position.set(TARGET.x, TARGET.y + 0.8, TARGET.z + dist);
+  controls.maxDistance = dist * 1.8;
+  controls.update();
+}
+
+setTimeout(() => { document.getElementById('hint').style.opacity = 0; }, 5000);
+
+// ------------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let time = 0;
+const camRight = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05) * MOTION;
+  time += dt;
+  wind.uTime.value = time;
+  updatePetals(dt, time);
+  controls.update();
+
+  // fade the far side of the tree for depth
+  const d = camera.position.distanceTo(controls.target);
+  scene.fog.near = d - treeRadius;
+  scene.fog.far = d + treeRadius * 2.2;
+
+  // keep the key light up and to the right of the viewer
+  key.target.position.copy(controls.target);
+  key.position.copy(camera.position)
+    .addScaledVector(camRight.setFromMatrixColumn(camera.matrixWorld, 0), d * 0.45);
+  key.position.y += d * 0.55;
+
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  composer.render();
+});
+</script>
+</body>
+</html>
