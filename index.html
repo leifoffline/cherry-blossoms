@@ -42,15 +42,29 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
 const SEED = Number(new URLSearchParams(location.search).get('seed')) || 3; // or add ?seed=12 to the URL
-const RENDER_HEIGHT = 300;      // internal resolution in pixels; lower = chunkier
+// The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
+// so its pixels are a sixth wider than they are tall. The window is not forced
+// to that size or shape; it is filled with pixels of that size and shape instead
+// (see resize), so a 4:3 window gets exactly 512x448 and a wider one more columns.
+const RENDER_WIDTH = 512, RENDER_HEIGHT = 448;
+const SUBPIXEL = 16;            // the PS2 placed vertices to a sixteenth of a pixel
 const PETAL_COUNT = 160;
 const IDLE_SECONDS = 10;        // the camera starts orbiting by itself after this long without input
 const SUN_DIR = new THREE.Vector3(-0.45, 0.42, -0.8).normalize();
 const WIND_DIR = new THREE.Vector3(1, 0, 0.35).normalize();
+// The project's palette, halfway between a bright arcade set and painted
+// Japanese-summer backgrounds: a deep cobalt
+// sky with shaded white clouds, greens that run from a bluish forest shadow to a
+// yellow-green highlight, warm earth and wood, cool grey stone. Each page and
+// model file keeps its own copy of the colours it uses; keep them in step.
 const PALETTE = {
-  bark: 0x8a6048,
-  blossoms: [0xffe6f0, 0xffd3e3, 0xffc0d8, 0xffaecd],
-  petal: 0xffc4da,
+  skyLight: 0xffffff, groundLight: 0xd8c4bc, sunLight: 0xfff4dc,
+  skyTop: [16, 80, 207], skyLow: [94, 167, 244], cloudShade: [168, 192, 224],
+  grass: ['#2d7c2f', '#3b9634', '#4fac39', '#67bf40', '#86d14b'],            // dark to light
+  grassBlades: ['#a2de55', '#bde96a', '#82cd48', '#24692a', '#1e5b26'],      // three highlights, two shadows
+  bark: 0x835d45,
+  blossoms: [0xfee6ef, 0xfcd2e2, 0xfac0d6, 0xf7aeca],
+  petal: 0xfac4d9,
 };
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -78,22 +92,56 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 1200);
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0xd8b8c4, 2.6));
-const sun = new THREE.DirectionalLight(0xfff6e0, 2.0);
+scene.add(new THREE.HemisphereLight(PALETTE.skyLight, PALETTE.groundLight, 2.6));
+const sun = new THREE.DirectionalLight(PALETTE.sunLight, 2.0);
 sun.position.copy(SUN_DIR).multiplyScalar(50);
 scene.add(sun);
 
-// --------------------------------------------------------- pixel textures
-function canvasTexture(w, h, paint, { pixelated = true, mipmaps = false } = {}) {
+// -------------------------------------------------------- painted textures
+// Small textures painted in code. They are filtered smoothly, as the PS2 did:
+// up close a texel blurs into its neighbours instead of showing as a square
+// (`pixelated: true` gives the hard PS1 squares back).
+// `cutout: true` is for textures with see-through parts that are cut out by
+// alphaTest. Smoothing would otherwise blend the black that lies under the
+// transparent pixels into the edges and outline every shape darkly, so the
+// colours at the edges are first spread outward under the transparent part; a
+// canvas cannot hold a colour in a fully transparent pixel, so these become data
+// textures (and cannot be repainted later, as the koi's skin is).
+function canvasTexture(w, h, paint, { pixelated = false, mipmaps = !pixelated, cutout = false } = {}) {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
-  paint(c.getContext('2d'), w, h);
-  const t = new THREE.CanvasTexture(c);
+  const ctx = c.getContext('2d', { willReadFrequently: cutout });
+  paint(ctx, w, h);
+  const t = cutout ? cutoutTexture(ctx, w, h) : new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   t.magFilter = pixelated ? THREE.NearestFilter : THREE.LinearFilter;
-  t.minFilter = mipmaps ? THREE.LinearMipmapLinearFilter : (pixelated ? THREE.NearestFilter : THREE.LinearFilter);
-  t.generateMipmaps = mipmaps;
+  t.generateMipmaps = mipmaps && !cutout;      // smaller copies of a cut-out thin its shapes away at a distance
+  t.minFilter = t.generateMipmaps ? THREE.LinearMipmapLinearFilter : (pixelated ? THREE.NearestFilter : THREE.LinearFilter);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+function cutoutTexture(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data, filled = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) filled[i] = d[i * 4 + 3] > 0 ? 1 : 0;
+  for (let pass = 0; pass < 4; pass++) {         // each pass carries the colours one pixel further out
+    const next = filled.slice();
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (filled[i]) continue;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy, j = Y * w + X;
+        if (X < 0 || Y < 0 || X >= w || Y >= h || !filled[j]) continue;
+        r += d[j * 4]; g += d[j * 4 + 1]; b += d[j * 4 + 2]; n++;
+      }
+      if (n) { d[i * 4] = r / n; d[i * 4 + 1] = g / n; d[i * 4 + 2] = b / n; next[i] = 1; }
+    }
+    filled.set(next);
+  }
+  const flipped = new Uint8Array(w * h * 4);     // a data texture's first row is its bottom one
+  for (let y = 0; y < h; y++) flipped.set(d.subarray(y * w * 4, (y + 1) * w * 4), (h - 1 - y) * w * 4);
+  const t = new THREE.DataTexture(flipped, w, h, THREE.RGBAFormat);
+  t.needsUpdate = true;
   return t;
 }
 
@@ -107,13 +155,13 @@ const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
     const L = THREE.MathUtils.lerp;
     return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
   };
-  const greens = ['#2c8f22', '#3aa628', '#4dbb2e', '#62cc36', '#7cdc40'];
+  const greens = PALETTE.grass;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const n = patch(x, y) + rr(-0.16, 0.16);
     ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
     ctx.fillRect(x, y, 1, 1);
   }
-  const blades = ['#9be84c', '#b4f060', '#84de42', '#247c1c', '#1f6e1a'];
+  const blades = PALETTE.grassBlades;
   for (let i = 0; i < 520; i++) {
     let x = (rand() * w) | 0, y = (rand() * h) | 0;
     const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
@@ -123,41 +171,70 @@ const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
       y -= 1; if (k % 2 === 1) x += lean;
     }
   }
-}, { mipmaps: true });
+});
 
-const barkTex = canvasTexture(8, 16, (ctx) => {
+// Texture sizes follow PS2 practice: a main object gets about one 128x128 sheet's
+// worth (here bark 32x64 plus blossom 64x64), background and props 64x64 or less.
+// The layout of each texture comes from the seeded stream, in the same order and
+// number of draws as when these were a quarter the size, so a seed still grows the
+// same tree; the fine detail comes from `grain`, a fixed pattern.
+const grain = (x, y) => {
+  let h = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+// bark: eight streaks running up the trunk, broken into ragged fibres, with
+// darker grooves between them and a little grit
+const barkTex = canvasTexture(32, 64, (ctx) => {
   const browns = ['#ffffff', '#e6d8cf', '#cdbbae', '#f2e8e2'];
+  const coarse = [];
   for (let x = 0; x < 8; x++) {
-    const streak = pick(browns);
-    for (let y = 0; y < 16; y++) {
-      ctx.fillStyle = rand() < 0.3 ? pick(browns) : streak; ctx.fillRect(x, y, 1, 1);
+    const streak = pick(browns), column = [];
+    for (let y = 0; y < 16; y++) column.push(rand() < 0.3 ? pick(browns) : streak);
+    coarse.push(column);
+  }
+  for (let x = 0; x < 32; x++) {
+    const slip = (grain(x, 99) * 4) | 0;         // each fibre sits a little higher or lower than its neighbour
+    for (let y = 0; y < 64; y++) {
+      const g = grain(x, y);
+      ctx.fillStyle = x % 4 === 0 && grain(x, y >> 3) < 0.55 ? '#b09c8e'
+        : g < 0.06 ? '#bba898' : g > 0.95 ? '#ffffff'
+        : coarse[x >> 2][((y + slip) >> 2) % 16];
+      ctx.fillRect(x, y, 1, 1);
     }
   }
 });
 
-// a bunch of blossom: little five-petal flowers scattered on a transparent square,
+// a bunch of blossom: five-petal flowers scattered on a transparent square,
 // thicker in the middle and ragged at the edge, with a few dark buds
-const blossomTex = canvasTexture(32, 32, (ctx) => {
+const blossomTex = canvasTexture(64, 64, (ctx) => {
   const petals = ['#ffffff', '#ffffff', '#fff2f7', '#ffe4ee', '#ffd6e6'];
+  const dot = (x, y) => { ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3); };   // a small round blob
   const flower = (x, y) => {
-    ctx.fillStyle = pick(petals);
-    ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3);       // plus shape
-    if (rand() < 0.6) ctx.fillRect(x - 1 + 2 * ((rand() * 2) | 0), y - 1 + 2 * ((rand() * 2) | 0), 1, 1); // odd extra petal
-    ctx.fillStyle = rand() < 0.5 ? '#e87aa4' : '#f29dbd';            // centre
-    ctx.fillRect(x, y, 1, 1);
+    const colour = pick(petals);
+    const turn = rand() < 0.6 ? ((rand() * 2) | 0) * 0.5 + ((rand() * 2) | 0) * 0.25 + 0.2 : 0;   // which way up it faces
+    for (let k = 0; k < 5; k++) {
+      const a = turn + k * 1.2566 - 1.5708, px = Math.round(x + Math.cos(a) * 2.4), py = Math.round(y + Math.sin(a) * 2.4);
+      ctx.fillStyle = colour; dot(px, py);
+      if (Math.sin(a) > 0.3) { ctx.fillStyle = '#ffc9dd'; ctx.fillRect(Math.round(x + Math.cos(a) * 3.4), Math.round(y + Math.sin(a) * 3.4), 1, 1); }   // lower petals shaded at the tip
+    }
+    ctx.fillStyle = rand() < 0.5 ? '#e87aa4' : '#f29dbd'; dot(x, y);   // centre
+    ctx.fillStyle = '#d2578a'; ctx.fillRect(x, y, 1, 1);
   };
-  for (let i = 0; i < 9; i++) {                                       // buds and stems behind the flowers
-    const a = rr(0, 6.28), r = rr(2, 13);
-    ctx.fillStyle = pick(['#c2567f', '#a8506a', '#8a5a48']);
-    ctx.fillRect(Math.round(16 + Math.cos(a) * r), Math.round(16 + Math.sin(a) * r), 1, 1);
+  for (let i = 0; i < 9; i++) {                 // buds behind the flowers
+    const a = rr(0, 6.28), r = rr(2, 13) * 2;
+    const x = Math.round(32 + Math.cos(a) * r), y = Math.round(32 + Math.sin(a) * r);
+    ctx.fillStyle = pick(['#c2567f', '#a8506a', '#8a5a48']); ctx.fillRect(x, y, 2, 2);
+    ctx.fillStyle = '#e08aa8'; ctx.fillRect(x, y, 1, 1);
   }
   for (let i = 0; i < 46; i++) {
-    const a = rr(0, 6.28), r = Math.pow(rand(), 0.75) * 13;
-    flower(Math.round(16 + Math.cos(a) * r), Math.round(16 + Math.sin(a) * r));
+    const a = rr(0, 6.28), r = Math.pow(rand(), 0.75) * 26;
+    flower(Math.round(32 + Math.cos(a) * r), Math.round(32 + Math.sin(a) * r));
   }
-});
+}, { cutout: true });
 
-// sky: blue gradient with wispy clouds, painted once from layered noise
+// sky: blue gradient with wispy clouds, painted once from layered noise; 256 wide, the
+// largest texture a PS2 scene would commonly spend on a sky, and smooth rather than pixelled
 function hash3(x, y, z) {
   let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2147483647) ^ (SEED * 9781);
   h = Math.imul(h ^ (h >>> 13), 1274126177);
@@ -173,31 +250,39 @@ function noise3(x, y, z) {
     L(L(at(0, 0, 0), at(1, 0, 0), u), L(at(0, 1, 0), at(1, 1, 0), u), v),
     L(L(at(0, 0, 1), at(1, 0, 1), u), L(at(0, 1, 1), at(1, 1, 1), u), v), w);
 }
-const skyTex = canvasTexture(512, 256, (ctx, w, h) => {
+const skyTex = canvasTexture(256, 128, (ctx, w, h) => {
   const img = ctx.createImageData(w, h);
-  const top = [10, 62, 214], low = [96, 170, 255];
+  const density = (a, y) => {                          // how thick the cloud is at angle `a` round the sky, row `y`
+    let n = 0, amp = 0.5, f = 1;
+    for (let o = 0; o < 5; o++) {
+      n += amp * noise3(Math.cos(a) * 2.2 * f, Math.sin(a) * 2.2 * f, (y / h) * 9 * f + o * 7.3);
+      amp *= 0.5; f *= 2;
+    }
+    return n;
+  };
+  const top = PALETTE.skyTop, low = PALETTE.skyLow;
   for (let y = 0; y < h; y++) {
     const up = Math.max(0, 1 - y / (h / 2));           // 1 at the zenith, 0 at the horizon and below
     for (let x = 0; x < w; x++) {
       const a = (x / w) * Math.PI * 2;                 // sampled around a circle so the seam matches
-      let n = 0, amp = 0.5, f = 1;
-      for (let o = 0; o < 5; o++) {
-        n += amp * noise3(Math.cos(a) * 2.2 * f, Math.sin(a) * 2.2 * f, (y / h) * 9 * f + o * 7.3);
-        amp *= 0.5; f *= 2;
-      }
+      const n = density(a, y);
       const cloud = THREE.MathUtils.smoothstep(n, 0.4, 0.62) * THREE.MathUtils.smoothstep(up, 0.02, 0.3);
+      // clouds are white on top and blue-grey underneath: a point is in shade
+      // by how much cloud there is a little way above it
+      const shade = 0.75 * THREE.MathUtils.smoothstep(density(a, y - h * 0.035), 0.46, 0.7);
       const g = Math.pow(up, 0.7);
       const i = (y * w + x) * 4;
-      for (let k = 0; k < 3; k++) img.data[i + k] = THREE.MathUtils.lerp(THREE.MathUtils.lerp(low[k], top[k], g), 255, cloud);
+      for (let k = 0; k < 3; k++) img.data[i + k] = THREE.MathUtils.lerp(THREE.MathUtils.lerp(low[k], top[k], g), THREE.MathUtils.lerp(255, PALETTE.cloudShade[k], shade), cloud);
       img.data[i + 3] = 255;
     }
   }
   ctx.putImageData(img, 0, 0);
-}, { pixelated: false });
+});
 skyTex.wrapT = THREE.ClampToEdgeWrapping;
 
-// ------------------------------------------------ PS1-style vertex shader
-// Every material gets vertex snapping (the wobble of old consoles); the tree
+// ------------------------------------------------ PS2-style vertex shader
+// Every material gets vertex snapping, to the PS2's sixteenth of a pixel (a
+// whole pixel, SUBPIXEL = 1, gives the heavy wobble of the PS1); the tree
 // also gets wind, from one function so bark and blossom move together.
 const shared = { uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) } };
 const PSX_GLSL = /* glsl */`
@@ -325,7 +410,7 @@ const TARGET = new THREE.Vector3(centre.x, treeTop * 0.5, centre.z);
 
 const bark = new THREE.Mesh(
   mergeGeometries(segments),
-  psx(new THREE.MeshLambertMaterial({ color: PALETTE.bark, map: barkTex, flatShading: true }), MOTION)
+  psx(new THREE.MeshLambertMaterial({ color: PALETTE.bark, map: barkTex }), MOTION)
 );
 scene.add(bark);
 segments.forEach((g) => g.dispose());
@@ -494,9 +579,10 @@ waitForIdle();
 
 // ------------------------------------------------- low-res target + screen
 // The scene is drawn into a small image, then one full-window pass puts it on
-// screen: either as plain hard pixels, or through the CRT filter.
+// screen: either stretched smoothly, which is the soft picture a PS2 gave over a
+// good cable, or through the CRT filter.
 const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
-  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
 });
 const screenMaterial = new THREE.ShaderMaterial({
   uniforms: {
@@ -532,14 +618,19 @@ const screenMaterial = new THREE.ShaderMaterial({
     void main() {
       vec3 col;
       if (uCrt < 0.5) {
-        col = texture2D(tScene, (floor(vUv * uRes) + 0.5) / uRes).rgb;   // plain hard pixels
+        col = texture2D(tScene, vUv).rgb;                // stretched smoothly over the window
       } else {
         vec2 uv = curve(vUv);
         vec2 px = uv * uRes;
         // colour fringing: red and blue land slightly apart
         col = vec3(row(px + vec2(0.45, 0.0)).r, row(px).g, row(px - vec2(0.45, 0.0)).b);
-        // scanlines: bright in the middle of each row, dark between rows
-        col *= mix(0.55, 1.18, pow(sin(fract(px.y) * 3.14159), 1.4));
+        // scanlines: bright in the middle of each row, dark between rows. With 448
+        // rows a row is only two or three screen pixels tall in most windows, too
+        // few to draw a dark gap without moire, so the lines fade out to their
+        // average brightness as the rows get that thin
+        float rowPx = 1.0 / fwidth(px.y);
+        float scan = mix(0.55, 1.18, pow(sin(fract(px.y) * 3.14159), 1.4));
+        col *= mix(0.95, scan, smoothstep(2.0, 4.0, rowPx));
         // phosphor stripes
         float stripe = mod(floor(gl_FragCoord.x), 3.0);
         col *= vec3(stripe == 0.0 ? 1.1 : 0.94, stripe == 1.0 ? 1.1 : 0.94, stripe == 2.0 ? 1.1 : 0.94);
@@ -580,10 +671,12 @@ addEventListener('keydown', (e) => {
 
 function resize() {
   const aspect = innerWidth / innerHeight;
-  const h = RENDER_HEIGHT, w = Math.round(h * aspect);
+  // RENDER_WIDTH columns span a 4:3 picture; a window of another shape keeps
+  // the same pixel width and simply shows more or fewer of them
+  const h = RENDER_HEIGHT, w = Math.round(RENDER_WIDTH * aspect / (4 / 3));
   sceneRT.setSize(w, h);
   screenMaterial.uniforms.uRes.value.set(w, h);
-  shared.uSnap.value.set(w / 2, h / 2);
+  shared.uSnap.value.set(w / 2 * SUBPIXEL, h / 2 * SUBPIXEL);
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = aspect;
