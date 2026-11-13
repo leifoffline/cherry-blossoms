@@ -3,10 +3,14 @@
 // elbows, wrists, hips, knees, ear bases, and a chain down the tail), and idles:
 // bouncing on his knees, bobbing his head, swinging his arms, swaying his tail,
 // blinking and now and then flicking an ear.
+//
+// He has three poses, picked in the viewer: idling, waving (one arm held out and
+// flapping, head tipped out of its way), and sleeping (flat on his front with his
+// chin on the floor, breathing slowly, Zs drifting up).
 registerModel({
   name: 'cat',
   label: 'Cat',
-  build({ THREE, psx, mergeGeometries }) {
+  build({ THREE, psx, canvasTexture, mergeGeometries }) {
     const V = (x, y, z) => new THREE.Vector3(x, y, z);
     const UP = V(0, 1, 0);
 
@@ -22,8 +26,10 @@ registerModel({
     const pinkMaterial = psx(new THREE.MeshLambertMaterial({ color: 0xf2b6c4, flatShading: true }));
     const inkMaterial = psx(new THREE.MeshBasicMaterial({ color: 0x141414 }));
     let white, pink;
+    const pieces = [];
     function piece(parent, pivot, shape) {
       const group = new THREE.Group();
+      pieces.push(group);
       group.userData.pivot = pivot.clone();
       group.position.subVectors(pivot, parent.userData.pivot);
       group.userData.rest = group.position.clone();
@@ -73,6 +79,7 @@ registerModel({
       }
       white.push(g.translate(0, 1.85, 0));
     });
+    const belly = torso.children[0];             // the torso's own mesh, swelled by his breathing
 
     // tail: grows from the middle of his lower back, then curls out and up to his left,
     // as a chain of short links
@@ -108,7 +115,7 @@ registerModel({
         limb(elbow, wrist(side), 0.17, 0.16);
       });
       const paw = piece(fore, wrist(side), () => ball(wrist(side), 0.27));
-      return { side, upper, fore, paw };
+      return { side, upper, fore, paw, along: wrist(side).sub(shoulder(side)).normalize() };
     });
 
     // ------------------------------------------------------------------ legs
@@ -125,12 +132,12 @@ registerModel({
         ball(knee, 0.192);
         limb(knee, ankle(side), 0.19, 0.17);
       });
-      piece(cat, ankle(side), () => {       // a flat foot pointing straight ahead
+      const foot = piece(cat, ankle(side), () => {       // a flat foot pointing straight ahead
         ball(ankle(side), 0.17);
         ball(ankle(side).add(V(0, 0, 0.2)), 0.25, 0.14, 0.42);
       });
       return {
-        thigh, shin, hip: hip(side).sub(HIPS), ankle: ankle(side),
+        side, thigh, shin, foot, hip: hip(side).sub(HIPS), ankle: ankle(side),
         along: ankle(side).sub(hip(side)).normalize(),            // the way the leg points at rest
         bone: hip(side).distanceTo(knee),
       };
@@ -218,6 +225,90 @@ registerModel({
       pink.push(place(new THREE.ConeGeometry(0.36, 0.66, 12).scale(1, 1, 0.45).translate(0, -0.12, 0.13)));
     }));
 
+    // Zs for when he sleeps: little pixel letters that always face the viewer
+    const zTexture = canvasTexture(8, 8, (ctx) => {
+      ctx.fillStyle = '#141414';
+      ctx.fillRect(1, 1, 6, 1); ctx.fillRect(1, 6, 6, 1);
+      for (let i = 0; i < 4; i++) ctx.fillRect(5 - i, 2 + i, 1, 1);
+    });
+    zTexture.wrapS = zTexture.wrapT = THREE.ClampToEdgeWrapping;
+    const zs = [0, 1, 2].map(() => {
+      const z = new THREE.Sprite(new THREE.SpriteMaterial({ map: zTexture, transparent: true, depthWrite: false }));
+      z.visible = false;
+      cat.add(z);
+      return z;
+    });
+
+    // ----------------------------------------------------------------- poses
+    const POSES = [
+      { name: 'idle', label: 'Idle' },
+      { name: 'wave', label: 'Waving' },
+      { name: 'sleep', label: 'Sleeping' },
+    ];
+    let pose = 'idle', now = 0;
+    function setVariant(name) {
+      pose = POSES.some((p) => p.name === name) ? name : 'idle';
+      for (const p of pieces) { p.position.copy(p.userData.rest); p.quaternion.identity(); }   // back to standing
+      belly.scale.setScalar(1);
+      for (const z of zs) z.visible = pose === 'sleep';
+      update(0, now);
+    }
+
+    // waving: his right arm (on the left as you face him, clear of his tail)
+    const WAVE = -1, WAVE_SPEED = 10;
+
+    // sleeping: the torso tips forward onto its front, so the body lies along the floor
+    // behind the head; within the torso, "up" now points forward and "forward" down.
+    const BED = V(0, 0.66, -1.7);                // where the hips rest
+    const TAIL_DOWN = new THREE.Quaternion().setFromAxisAngle(UP, -0.9)
+      .multiply(new THREE.Quaternion().setFromAxisAngle(V(1, 0, 0), -Math.PI / 2));   // out behind him and round to one side, along the floor
+    function sleep(time) {
+      now = time;
+      const breath = Math.sin(time * 1.5);
+      torso.position.copy(BED);
+      torso.rotation.set(Math.PI / 2, 0, 0);
+      belly.scale.set(1 + 0.04 * breath, 1, 1 + 0.04 * breath);
+
+      // head: turned back level so he still faces forward, pushed out ahead of the body
+      // and let down until the chin is on the floor, lolling a little to one side
+      head.position.copy(head.userData.rest).add(V(0, 1.3, 0.5 - 0.012 * breath));
+      head.rotation.set(-Math.PI / 2 + 0.012 * breath, 0, 0.1);
+
+      // arms flop out to the sides, paws on the floor under his cheeks
+      for (const arm of arms) {
+        arm.upper.quaternion.setFromUnitVectors(arm.along, reach.set(arm.side * 0.9, 0.4, 0.3).normalize());
+        arm.fore.rotation.set(0, 0, 0);
+        arm.paw.rotation.set(0, 0, 0);
+      }
+      // legs trail out behind, soles up
+      for (const leg of legs) {
+        hipAt.copy(BED).x += leg.side * 0.3;
+        leg.thigh.position.copy(hipAt);
+        leg.thigh.quaternion.setFromUnitVectors(leg.along, reach.set(leg.side * 0.45, -0.35, -0.8).normalize());
+        kneeAt.copy(hipAt).addScaledVector(reach, leg.bone);
+        leg.shin.position.copy(kneeAt);
+        leg.shin.quaternion.setFromUnitVectors(leg.along, reach.set(leg.side * 0.15, -0.5, -1).normalize());
+        leg.foot.position.copy(kneeAt).addScaledVector(reach, leg.bone);
+        leg.foot.rotation.set(Math.PI, 0, 0);
+      }
+      // tail: laid along the floor, the tip stirring now and then
+      tail.forEach((link, i) => {
+        if (i === 0) link.quaternion.copy(TAIL_DOWN);
+        else link.rotation.set(0, 0.1 * Math.sin(time * 0.7 - i * 0.7) * (i / 5), 0);
+      });
+      ears.forEach((ear, i) => { ear.rotation.z = -SIDES[i] * 0.14; });   // ears droop
+      eyesClosed.visible = true;
+      eyesOpen.visible = false;
+
+      // Zs rise from over his head one after another, growing and fading
+      zs.forEach((z, i) => {
+        const u = (time * 0.3 + i / zs.length) % 1;
+        z.position.set(1.0 + 0.7 * u + 0.12 * Math.sin(u * 7), 2.9 + 1.9 * u, 0.9);
+        z.scale.setScalar(0.3 + 0.5 * u);
+        z.material.opacity = Math.min(1, 4 * u, 3 * (1 - u));
+      });
+    }
+
     // ------------------------------------------------------------ animation
     const BOB = 3.2;                             // idle speed; one bounce takes about two seconds
     const BLINK = 0.16;                          // seconds the eyes stay shut
@@ -227,6 +318,8 @@ registerModel({
     const hipAt = V(), kneeAt = V(), reach = V(), forward = V(), FRONT = V(0, 0, 1);
 
     function update(dt, time) {
+      if (pose === 'sleep') return sleep(time);
+      now = time;
       const phase = time * BOB;
       const beat = Math.sin(phase);
 
@@ -265,6 +358,16 @@ registerModel({
         arm.paw.rotation.x = 0.25 * swing(1.4);
       }
 
+      if (pose === 'wave') {
+        // one arm held out to the side, the forearm flapping up and down from the
+        // elbow and the paw trailing after it; the head tips away to leave it room
+        const arm = arms.find((a) => a.side === WAVE), flap = time * WAVE_SPEED;
+        arm.upper.rotation.set(0, 0, WAVE * (0.8 + 0.04 * beat));
+        arm.fore.rotation.set(0, 0, WAVE * (0.4 + 0.4 * Math.sin(flap)));
+        arm.paw.rotation.set(0, 0, WAVE * 0.35 * Math.sin(flap - 0.8));
+        head.rotation.z += WAVE * 0.16;
+      }
+
       // tail: a slow wave travelling out to the tip
       tail.forEach((link, i) => {
         link.rotation.y = 0.11 * Math.sin(phase * 0.5 - i * 0.6);
@@ -294,6 +397,6 @@ registerModel({
     update(0, 0);
 
     // his big head fills a snug frame, so start further back and level with him
-    return { object: cat, update, view: { back: 1.35, rise: 0.04 } };
+    return { object: cat, update, variants: POSES, variantLabel: 'Pose', setVariant, view: { back: 1.35, rise: 0.04 } };
   },
 });
