@@ -4,9 +4,10 @@
 // bouncing on his knees, bobbing his head, swinging his arms, swaying his tail,
 // blinking and now and then flicking an ear.
 //
-// He has three poses, picked in the viewer: idling, waving (one arm held out and
-// flapping, head tipped out of its way), and sleeping (flat on his front with his
-// chin on the floor, breathing slowly, Zs drifting up).
+// He has four poses, picked in the viewer: idling, waving (one arm held out and
+// flapping, head tipped out of its way), ears down (the ears fold out flat to the
+// sides and the head hangs), and sleeping (on his back with his arms crossed on his
+// chest and one leg resting over the other knee, ears down, Zs drifting up).
 registerModel({
   name: 'cat',
   label: 'Cat',
@@ -22,8 +23,8 @@ registerModel({
     cat.userData.pivot = V(0, 0, 0);
     // white with a little glow of its own: the lit side would burn out at full white,
     // and the side away from the sun would otherwise go grey
-    const whiteMaterial = psx(new THREE.MeshLambertMaterial({ color: 0xd0d0d0, emissive: 0x959595, flatShading: true }));
-    const pinkMaterial = psx(new THREE.MeshLambertMaterial({ color: 0xf2b6c4, flatShading: true }));
+    const whiteMaterial = psx(new THREE.MeshLambertMaterial({ color: 0xd0d0d0, emissive: 0x959595 }));
+    const pinkMaterial = psx(new THREE.MeshLambertMaterial({ color: 0xf2b6c4 }));
     const inkMaterial = psx(new THREE.MeshBasicMaterial({ color: 0x141414 }));
     let white, pink;
     const pieces = [];
@@ -213,16 +214,46 @@ registerModel({
       eyesClosed.visible = false;
     });
 
-    // ears: cones leaning outward, shallow in front and full and rounded behind, each
-    // with a pink inner face, hinged at the base
-    const earTilt = { '-1': 0.7, '1': 0.35 };   // his right ear flops out further, as drawn
-    const ears = SIDES.map((side) => piece(head, V(side * 1.42, 4.6, 0), () => {
-      const place = (g) => g.rotateZ(-side * earTilt[side]).translate(side * 1.5, 4.95, 0);
-      const shell = new THREE.ConeGeometry(0.58, 1.05, 16, 4);
-      const p = shell.attributes.position;
-      for (let i = 0; i < p.count; i++) p.setZ(i, p.getZ(i) * (p.getZ(i) > 0 ? 0.45 : 1.15));
-      white.push(place(shell));
-      pink.push(place(new THREE.ConeGeometry(0.36, 0.66, 12).scale(1, 1, 0.45).translate(0, -0.12, 0.13)));
+    // ears: each is a cupped shell like a real cat's rather than a cone. Seen from the
+    // front it is a broad triangle with bowed sides and a rounded tip; the back swells
+    // out and the front is hollow, lined pink, and opens forward and a little outward.
+    // Each is hinged at the middle of its own base, which lies inside the head: turning
+    // there swings the tip without the base sliding about, so the ear neither sinks
+    // into the head nor lifts off it.
+    const EAR_TILT = 0.5, EAR_TURN = 0.3;        // lean outward, and how far the hollow faces outward
+    const EAR_H = 1.3, EAR_W = 0.74, EAR_D = 0.5; // height, half width at the base, and how far the back swells
+    const EAR_AT = V(1.5, 5.0, 0);               // middle of the ear on his left
+    const earBase = (side) => V(side * (EAR_AT.x - Math.sin(EAR_TILT) * EAR_H / 2), EAR_AT.y - Math.cos(EAR_TILT) * EAR_H / 2, 0);
+    const earWidth = (v) => EAR_W * (1 - v ** 1.3) ** 0.75;       // half width, from base (v = 0) to tip
+    const earDepth = (v) => EAR_D * (1 - v) ** 0.7;
+    const earHollow = (u, v) => -0.62 * earDepth(v) * (1 - u * u); // the front face, deepest down the middle
+    // a grid of points joined into a smooth surface; `closed` joins its two side edges
+    function sheet(cols, rows, closed, at) {
+      const points = [], index = [], across = closed ? cols : cols + 1;
+      for (let j = 0; j <= rows; j++) for (let i = 0; i < across; i++) points.push(...at(i / cols, j / rows));
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const a = j * across + i, b = j * across + (i + 1) % across, c = a + across, d = b + across;
+        index.push(a, b, c, b, d, c);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(points, 3));
+      g.setIndex(index);
+      g.computeVertexNormals();
+      return g;
+    }
+    const ears = SIDES.map((side) => piece(head, earBase(side), () => {
+      const base = earBase(side);
+      const place = (g) => g.rotateY(side * EAR_TURN).rotateZ(-side * EAR_TILT).translate(base.x, base.y, base.z);
+      // the shell: rings running round the back (a half ellipse) and across the hollow front
+      white.push(place(sheet(20, 10, true, (a, v) => {
+        const u = Math.sin(a * Math.PI * 2), c = Math.cos(a * Math.PI * 2);
+        return [earWidth(v) * u, v * EAR_H, c < 0 ? earDepth(v) * c : earHollow(u, v)];
+      })));
+      // the pink lining: a smaller ear shape lying just proud of the hollow
+      pink.push(place(sheet(6, 6, false, (s, t) => {
+        const v = 0.76 * t, x = (s * 2 - 1) * 0.66 * earWidth(t);
+        return [x, v * EAR_H, earHollow(x / earWidth(v), v) + 0.03];
+      })));
     }));
 
     // Zs for when he sleeps: little pixel letters that always face the viewer
@@ -243,6 +274,7 @@ registerModel({
     const POSES = [
       { name: 'idle', label: 'Idle' },
       { name: 'wave', label: 'Waving' },
+      { name: 'sulk', label: 'Ears down' },
       { name: 'sleep', label: 'Sleeping' },
     ];
     let pose = 'idle', now = 0;
@@ -257,53 +289,106 @@ registerModel({
     // waving: his right arm (on the left as you face him, clear of his tail)
     const WAVE = -1, WAVE_SPEED = 10;
 
-    // sleeping: the torso tips forward onto its front, so the body lies along the floor
-    // behind the head; within the torso, "up" now points forward and "forward" down.
-    const BED = V(0, 0.66, -1.7);                // where the hips rest
-    const TAIL_DOWN = new THREE.Quaternion().setFromAxisAngle(UP, -0.9)
-      .multiply(new THREE.Quaternion().setFromAxisAngle(V(1, 0, 0), -Math.PI / 2));   // out behind him and round to one side, along the floor
-    function sleep(time) {
+    // sleeping: flat on his back, feet toward the viewer and off to one side so that
+    // both the face and the legs can be seen. In the "lying frame" used below x runs
+    // across him, y is up and z points from his head to his feet; LIE turns that frame
+    // into the scene's. Within the torso, "up" now points toward his head and "forward"
+    // at the sky.
+    const turn = (axis, angle) => new THREE.Quaternion().setFromAxisAngle(axis, angle);
+    const ACROSS = V(1, 0, 0);
+    const LIE_TURN = 0.3;
+    const LIE = turn(UP, LIE_TURN);
+    const BED = V(0, 0.6, 1.0).applyQuaternion(LIE);              // where the hips rest: the back just touches the floor
+    const LEAN = 0.05;                           // shoulders a touch higher than hips
+    const LAID = LIE.clone().multiply(turn(ACROSS, -Math.PI / 2 + LEAN));
+    // The head is far deeper than the body, so with its back on the floor it sits
+    // propped up, chin toward the chest, which also shows the viewer his face.
+    // HEAD_DROP then lets it down until the back of the head (taken as the plain
+    // ellipsoid) touches the floor; the neck joint is hidden inside the head anyway.
+    const HEAD_PROP = 0.85;
+    const HEAD_DROP = BED.y + (NECK.y - HIPS.y) * Math.sin(LEAN) + (HEAD.y - NECK.y) * Math.sin(HEAD_PROP + LEAN)
+      - Math.hypot(HB * Math.sin(HEAD_PROP + LEAN), HC * Math.cos(HEAD_PROP + LEAN));
+    // The tail's curl lies nearly in one plane (TAIL_PLANE is its normal). Laying that
+    // plane on the floor and turning it puts the tail out from under his raised leg,
+    // curling round toward his feet.
+    const TAIL_PLANE = V(-0.57, 0.76, -0.32).normalize();
+    const TAIL_HEADING = LIE_TURN + 1.9;         // the way the tail first leaves him, as a compass turn from the viewer
+    const TAIL_FLAT = (() => {
+      const flat = new THREE.Quaternion().setFromUnitVectors(TAIL_PLANE, UP);
+      const out = V(0.2, -0.08, -0.55).applyQuaternion(flat);     // the tail's first stretch, once flat
+      return turn(UP, TAIL_HEADING - Math.atan2(out.x, out.z)).multiply(flat);
+    })();
+    const PROP = -1, CROSS = 1;                  // his right knee is up, and his left leg rests across it
+    const q = new THREE.Quaternion(), basis = new THREE.Matrix4(), side = V(), toes = V(), headAt = V();
+    function sleep(dt, time) {
       now = time;
       const breath = Math.sin(time * 1.5);
       torso.position.copy(BED);
-      torso.rotation.set(Math.PI / 2, 0, 0);
+      torso.quaternion.copy(LAID);
       belly.scale.set(1 + 0.04 * breath, 1, 1 + 0.04 * breath);
 
-      // head: turned back level so he still faces forward, pushed out ahead of the body
-      // and let down until the chin is on the floor, lolling a little to one side
-      head.position.copy(head.userData.rest).add(V(0, 1.3, 0.5 - 0.012 * breath));
-      head.rotation.set(-Math.PI / 2 + 0.012 * breath, 0, 0.1);
+      // head: propped on its own back, lolling a little to one side
+      head.position.copy(head.userData.rest).z -= HEAD_DROP;
+      head.rotation.set(HEAD_PROP + 0.012 * breath, 0, 0.08);
 
-      // arms flop out to the sides, paws on the floor under his cheeks
+      // arms crossed on his chest: each upper arm comes forward round the ribs and the
+      // forearm lies across to the far side, his left over his right; they ride on his
+      // breathing. Directions are in the torso's own frame.
       for (const arm of arms) {
-        arm.upper.quaternion.setFromUnitVectors(arm.along, reach.set(arm.side * 0.9, 0.4, 0.3).normalize());
-        arm.fore.rotation.set(0, 0, 0);
+        const over = arm.side === CROSS;
+        arm.upper.position.copy(arm.upper.userData.rest).z += 0.025 * breath;
+        arm.upper.quaternion.setFromUnitVectors(arm.along, reach.set(arm.side * 0.14, over ? -0.26 : -0.4, over ? 0.6 : 0.5).normalize());
+        reach.set(-arm.side * 0.95, over ? 0.02 : 0.1, over ? 0.2 : 0.12).normalize();
+        arm.fore.quaternion.setFromUnitVectors(arm.along, reach.applyQuaternion(q.copy(arm.upper.quaternion).invert()));
         arm.paw.rotation.set(0, 0, 0);
       }
-      // legs trail out behind, soles up
-      for (const leg of legs) {
-        hipAt.copy(BED).x += leg.side * 0.3;
-        leg.thigh.position.copy(hipAt);
-        leg.thigh.quaternion.setFromUnitVectors(leg.along, reach.set(leg.side * 0.45, -0.35, -0.8).normalize());
-        kneeAt.copy(hipAt).addScaledVector(reach, leg.bone);
-        leg.shin.position.copy(kneeAt);
-        leg.shin.quaternion.setFromUnitVectors(leg.along, reach.set(leg.side * 0.15, -0.5, -1).normalize());
-        leg.foot.position.copy(kneeAt).addScaledVector(reach, leg.bone);
-        leg.foot.rotation.set(Math.PI, 0, 0);
-      }
+
+      // legs: one knee up with the foot flat on the floor, the other leg bent out to
+      // the side with its ankle resting on that knee, the foot nodding slowly
+      const prop = legs.find((leg) => leg.side === PROP), cross = legs.find((leg) => leg.side === CROSS);
+      hipAt.copy(prop.hip).applyQuaternion(LAID).add(BED);
+      prop.thigh.position.copy(hipAt);
+      prop.thigh.quaternion.setFromUnitVectors(prop.along, reach.set(0.1, 0.16, 1).normalize().applyQuaternion(LIE));
+      kneeAt.copy(hipAt).addScaledVector(reach, prop.bone);
+      prop.shin.position.copy(kneeAt);
+      prop.shin.quaternion.setFromUnitVectors(prop.along, reach.set(0, -1, 0.3).normalize().applyQuaternion(LIE));
+      prop.foot.position.copy(kneeAt).addScaledVector(reach, prop.bone);
+      prop.foot.quaternion.copy(LIE);
+
+      const rest = forward.copy(kneeAt).add(side.set(-0.04, 0.37, 0.02).applyQuaternion(LIE));   // the ankle's seat on the knee
+      hipAt.copy(cross.hip).applyQuaternion(LAID).add(BED);
+      reach.subVectors(rest, hipAt);
+      const half = reach.length() / 2;
+      reach.normalize();
+      side.set(1, 0.75, 0.2).applyQuaternion(LIE);                // the knee falls outward and up
+      side.addScaledVector(reach, -side.dot(reach)).normalize();
+      kneeAt.copy(hipAt).addScaledVector(reach, half).addScaledVector(side, Math.sqrt(cross.bone ** 2 - half ** 2));
+      cross.thigh.position.copy(hipAt);
+      cross.thigh.quaternion.setFromUnitVectors(cross.along, reach.subVectors(kneeAt, hipAt).normalize());
+      cross.shin.position.copy(kneeAt);
+      cross.shin.quaternion.setFromUnitVectors(cross.along, reach.subVectors(rest, kneeAt).normalize());
+      cross.foot.position.copy(rest);
+      toes.set(-0.2, 0.75 + 0.12 * Math.sin(time * 0.9), 0.6).applyQuaternion(LIE);   // toes in the air
+      toes.addScaledVector(reach, -toes.dot(reach)).normalize();
+      side.crossVectors(toes, reach);                             // the foot's own x: (-shin) x toes
+      cross.foot.quaternion.setFromRotationMatrix(basis.makeBasis(side, kneeAt.copy(reach).negate(), toes));
+
       // tail: laid along the floor, the tip stirring now and then
       tail.forEach((link, i) => {
-        if (i === 0) link.quaternion.copy(TAIL_DOWN);
-        else link.rotation.set(0, 0.1 * Math.sin(time * 0.7 - i * 0.7) * (i / 5), 0);
+        if (i === 0) {
+          link.position.copy(link.userData.rest).z -= 0.1;        // down onto the floor
+          link.quaternion.copy(LAID).invert().multiply(TAIL_FLAT);
+        } else link.quaternion.setFromAxisAngle(TAIL_PLANE, 0.1 * Math.sin(time * 0.7 - i * 0.7) * (i / 5));
       });
-      ears.forEach((ear, i) => { ear.rotation.z = -SIDES[i] * 0.14; });   // ears droop
+      poseEars(dt, 1);                           // ears down, and still twitching in his sleep
       eyesClosed.visible = true;
       eyesOpen.visible = false;
 
       // Zs rise from over his head one after another, growing and fading
+      headAt.subVectors(HEAD, NECK).applyQuaternion(head.quaternion).add(head.position).applyQuaternion(LAID).add(BED);
       zs.forEach((z, i) => {
         const u = (time * 0.3 + i / zs.length) % 1;
-        z.position.set(1.0 + 0.7 * u + 0.12 * Math.sin(u * 7), 2.9 + 1.9 * u, 0.9);
+        z.position.set(headAt.x + 1.0 + 0.7 * u + 0.12 * Math.sin(u * 7), headAt.y + 1.3 + 1.9 * u, headAt.z + 0.6);
         z.scale.setScalar(0.3 + 0.5 * u);
         z.material.opacity = Math.min(1, 4 * u, 3 * (1 - u));
       });
@@ -312,13 +397,46 @@ registerModel({
     // ------------------------------------------------------------ animation
     const BOB = 3.2;                             // idle speed; one bounce takes about two seconds
     const BLINK = 0.16;                          // seconds the eyes stay shut
-    const FLICK = 0.28;                          // seconds an ear flick lasts
+    const FLICK = 0.5;                           // seconds an ear flick takes to die away
     let untilBlink = 2, shut = 0;
     let untilFlick = 4, flick = 0, flickEar = 0;
+    // ears: every so often one flicks, as a cat's does at a fly. It snaps back and a
+    // little outward, then springs upright again, overshooting less each time until
+    // it is still. Now and then the same ear goes twice.
+    //
+    // `down` (0 or 1) is where the ears are heading: up, or folded into "aeroplane
+    // ears", swung out flat to the sides and rolled about their own length so the
+    // hollows face the floor and the backs show on top. They ease from one to the
+    // other, and slide a little way out of the head as they fold so that the whole
+    // ear still shows.
+    const EAR_FOLD = 1.1, EAR_ROLL = 0.8, EAR_SLIDE = V(0.3, -0.12, 0), EAR_EASE = 7;
+    const earAxis = SIDES.map((side) => V(side * Math.sin(EAR_TILT), Math.cos(EAR_TILT), 0));
+    const fold = new THREE.Quaternion(), roll = new THREE.Quaternion();
+    let earDown = 0;
+    function poseEars(dt, down) {
+      earDown += (down - earDown) * (1 - Math.exp(-dt * EAR_EASE));
+      const e = earDown * earDown * (3 - 2 * earDown);
+      if (flick > 0) flick -= dt;
+      else if ((untilFlick -= dt) <= 0) {
+        if (untilFlick > -1) flickEar = Math.random() < 0.5 ? 0 : 1;   // a second flick (see below) keeps the same ear
+        flick = FLICK;
+        untilFlick = Math.random() < 0.25 ? -1 : 3 + Math.random() * 5;
+      }
+      ears.forEach((ear, i) => {
+        const t = i === flickEar && flick > 0 ? FLICK - flick : 0;
+        const spring = Math.exp(-t * 9) * Math.sin(t * 38);          // a fading wobble, at its widest about 0.04 s in
+        fold.setFromAxisAngle(FRONT, -SIDES[i] * (EAR_FOLD * e + 0.12 * spring));
+        roll.setFromAxisAngle(earAxis[i], SIDES[i] * EAR_ROLL * e);
+        ear.quaternion.setFromAxisAngle(ACROSS, -0.3 * spring).premultiply(roll).premultiply(fold);
+        ear.position.copy(ear.userData.rest);
+        ear.position.x += SIDES[i] * EAR_SLIDE.x * e;
+        ear.position.y += EAR_SLIDE.y * e;
+      });
+    }
     const hipAt = V(), kneeAt = V(), reach = V(), forward = V(), FRONT = V(0, 0, 1);
 
     function update(dt, time) {
-      if (pose === 'sleep') return sleep(time);
+      if (pose === 'sleep') return sleep(dt, time);
       now = time;
       const phase = time * BOB;
       const beat = Math.sin(phase);
@@ -347,6 +465,7 @@ registerModel({
       head.position.y = head.userData.rest.y + 0.045 * Math.sin(phase - 0.6);
       head.rotation.x = 0.03 * Math.sin(phase - 0.9);
       head.rotation.z = 0.035 * Math.sin(phase * 0.5);
+      if (pose === 'sulk') head.rotation.x += 0.3 * earDown;      // hangs his head as the ears come down
 
       // arms: swing from the shoulder in turn; the elbow and wrist follow a little late,
       // the elbow only ever bending forward
@@ -374,14 +493,7 @@ registerModel({
         link.rotation.z = 0.05 * Math.sin(phase - i * 0.5);
       });
 
-      // ears: every so often one flicks outward
-      if (flick > 0) {
-        flick -= dt;
-        const side = SIDES[flickEar];
-        ears[flickEar].rotation.z = flick > 0 ? -side * 0.3 * Math.sin((1 - flick / FLICK) * Math.PI * 2) ** 2 : 0;
-      } else if ((untilFlick -= dt) <= 0) {
-        flick = FLICK; flickEar = Math.random() < 0.5 ? 0 : 1; untilFlick = 3 + Math.random() * 5;
-      }
+      poseEars(dt, pose === 'sulk' ? 1 : 0);
 
       // blink
       if (shut > 0) {

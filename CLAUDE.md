@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A low-poly, PS1/PS2-style WebGL scene and model viewer, written as plain HTML and JavaScript on three.js (loaded from a CDN through an import map). There is no build step, package manager, linter or test suite: open the HTML files in a browser, straight from disk (`file://`) or from any static server.
+A low-poly, PS2-style WebGL scene and model viewer, written as plain HTML and JavaScript on three.js (loaded from a CDN through an import map). There is no build step, package manager, linter or test suite: open the HTML files in a browser, straight from disk (`file://`) or from any static server.
 
 - `index.html`: the standalone cherry blossom scene.
 - `viewer.html`: a viewer for the models in `models/`, with a model picker, outdoor and white-room backdrops, and CRT and spin toggles.
@@ -31,13 +31,17 @@ A low-poly, PS1/PS2-style WebGL scene and model viewer, written as plain HTML an
 
 ### Three pages, one renderer, duplicated
 
-`index.html`, `viewer.html` and `pond.html` each contain their own copy of the renderer; they share no code. A change to the look (the vertex-snapping shader, pixel textures, sky, grass, CRT filter) has to be made in all three. `models/cherry-tree.js` is likewise a repackaged copy of the tree that `index.html` grows inline.
+`index.html`, `viewer.html` and `pond.html` each contain their own copy of the renderer; they share no code. A change to the look (the vertex-snapping shader, painted textures, palette, sky, grass, CRT filter) has to be made in all three. `models/cherry-tree.js` is likewise a repackaged copy of the tree that `index.html` grows inline.
 
 The shared look comes from three things:
 
-- **Low-resolution target**: the scene is drawn into a render target `RENDER_HEIGHT` (300) pixels tall, then a full-window shader pass puts it on screen, either as hard pixels or through the CRT filter.
-- **`psx(material, windAmount)`**: wraps a three.js material, patching its vertex shader through `onBeforeCompile` to snap vertices to the low-resolution grid (the PS1 wobble) and, optionally, to apply wind. Every material in the scene should go through it.
-- **`canvasTexture(w, h, paint, options)`**: makes a nearest-filtered texture from a small canvas painted in code. All textures are generated this way; there are no image assets.
+- **Low-resolution target**: the scene is drawn into a render target at the PS2's 512×448 pixel density (`RENDER_WIDTH` columns per 4:3 of window, `RENDER_HEIGHT` rows, so pixels are a sixth wider than tall; a wider window gets more columns), then a full-window shader pass stretches it over the window, either smoothly (bilinear, the soft PS2 picture) or through the CRT filter. The CRT scanlines fade out when a row is under about three screen pixels tall, to avoid moire.
+- **`psx(material, windAmount)`**: wraps a three.js material, patching its vertex shader through `onBeforeCompile` to snap vertices to a sixteenth of a low-resolution pixel, as the PS2 did (`SUBPIXEL`; 1 gives the PS1 wobble) and, optionally, to apply wind. Every material in the scene should go through it.
+- **`canvasTexture(w, h, paint, options)`**: makes a smoothly filtered texture (bilinear with mipmaps, as on the PS2; `pixelated: true` gives hard PS1 texels) from a small canvas painted in code. Textures cut out with `alphaTest` must pass `cutout: true`, which spreads edge colours under the transparent pixels so filtering does not outline the shapes darkly; those become data textures and cannot be repainted. All textures are generated this way; there are no image assets. Sizes follow PS2 practice: a main object (koi, tree) gets about one 128×128 sheet's worth in total, background and props 64×64 or smaller, and the sky, the largest, is 256×128. The tree's textures draw their layout from the seeded stream in a fixed number and order of draws (changing that regrows the tree) and take fine detail from a fixed `grain` pattern instead.
+
+The target look is the PS2, not the PS1: smooth filtered textures, smooth (Gouraud) shading rather than `flatShading`, sub-pixel vertex placement, a soft 448-line picture. Avoid hard pixels and faceted shading.
+
+**Palette**: colours sit halfway between the bright, saturated set the project started with and painted Japanese-summer backgrounds: a deep cobalt sky with white clouds shaded blue-grey underneath, greens running from a bluish forest shadow to a yellow-green highlight (never one bright lime), warm earth and wood, cool grey stone, dark blue-green water. Each page has a `PALETTE` object near the top (the pond's is the fullest) and `cherry-tree.js` has its own; the shared entries (lights, sky, grass, tree) are duplicated and must be kept in step. Koi and cat keep their own character colours.
 
 Everything random is drawn from a seeded generator (`mulberry32`), so a given `?seed=` always produces the same scene.
 
@@ -60,7 +64,7 @@ A model file calls `registerModel({ name, label, build })`. `build(ctx)` receive
 
 ### How the existing models are built
 
-- **`cat.js`**: rigid pieces, each a group that turns about its own joint, built in whole-model coordinates and shifted to the joint by the `piece()` helper. The legs are placed each frame so the feet stay planted. Its poses (idle, waving, sleeping) are exposed as variants: `setVariant` returns every piece to its rest position, then `update` poses the pieces for the current pose each frame.
+- **`cat.js`**: rigid pieces, each a group that turns about its own joint, built in whole-model coordinates and shifted to the joint by the `piece()` helper. The legs are placed each frame so the feet stay planted. Its poses (idle, waving, ears down, sleeping on his back) are exposed as variants: `setVariant` returns every piece to its rest position, then `update` poses the pieces for the current pose each frame.
 - **`koi.js`**: a single lofted body mesh with a painted 128×64 skin texture. Varieties differ only in the function that paints the skin and fins, apart from the butterfly koi, which rebuilds the fins longer. Swimming is done on the CPU: each frame every vertex is shifted from its stored rest position by a wave that runs down the spine. Its materials chain a second `onBeforeCompile` on top of `psx()` (the `wet` helper) to add a highlight, edge sheen and drifting light ripples; this is the pattern to follow for any per-model shader effect.
 
 White surfaces use a dimmed colour plus an emissive term (see the comments in both files): the scene lighting is strong enough that a plain white material burns out on the sunlit side and goes grey in the shade.
@@ -71,7 +75,9 @@ White surfaces use a dimmed colour plus an emissive term (see the comments in bo
 
 - The pond outline is the function `rim(angle, k)`; everything is placed with it, so changing the pond's size or shape there moves the banks, plants and koi with it.
 - Its `psx(material, windAmount, flex)` differs from the other two pages: wind bends a plant about the point `windRoot` held when the material was made (so the tree can stand away from the origin), and `flex` sets the heights between which bending grows (so short plants such as reeds and grass can sway).
-- Water is layered transparent sheets, not a shader: two blue tints at different depths and two additive ripple textures sliding across each other.
+- Water is layered transparent sheets, not a shader, in the manner of PS2 games: two turquoise tints at different depths over a pale sandy bed, and one smooth (linear-filtered, the only such texture) caustic web laid three times as additive layers sliding in different directions, twice on the surface and once on the bed.
+- Boulders and pebbles ring the rim (`rockGeometry`: a noise-lumped icosahedron, smooth-shaded, textured by box projection), merged into one mesh, with a heap on the far bank. They draw from their own random stream (`rockRand`) so changing them leaves the plants in place, and record footprints in `boulders` so the bank grass keeps clear.
+- The camera keeps one angle. The default view (`resetView`, sized to the window by `frameView`) shows the whole pond and cannot be moved; zooming in lets a drag slide the view, and `holdView` limits how far by how close in the camera is.
 - Rules carried over from the ASCII pond: motion stays calm, no water lilies (pads only), reeds and cattails stay short.
 
 ### Viewer URL options
