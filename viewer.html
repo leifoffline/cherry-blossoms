@@ -39,27 +39,33 @@
 </script>
 </head>
 <body>
-<div class="bar" id="left"><select id="model" aria-label="Model"></select></div>
+<div class="bar" id="left">
+  <select id="model" aria-label="Model"></select>
+  <select id="variant" aria-label="Variant" hidden></select>
+</div>
 <div class="bar" id="right">
   <button id="env" type="button">BG: outdoors</button>
   <button id="spin" type="button" aria-pressed="false">SPIN: off</button>
   <button id="crt" type="button" aria-pressed="true">CRT: on</button>
 </div>
-<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · S spin · R reset view</div>
+<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · S spin · R reset view · V next variant</div>
 <script type="module">
 // Viewing environment for models built with the low-poly renderer from index.html.
 //
 // To add a model: write models/<name>.js (see models/cherry-tree.js for the shape of
 // one) and add <name> to MODEL_FILES below. It then shows up in the picker, and can be
 // opened directly with viewer.html?model=<name>. Other URL options: ?env=room or
-// ?env=outdoors, ?crt=off, ?spin=on, ?seed=12.
+// ?env=outdoors, ?crt=off, ?spin=on, ?seed=12, ?variant=<name>.
+//
+// A model that comes in several versions (see models/koi.js) returns `variants`, a
+// list of { name, label }, and `setVariant(name)`; they get a second picker.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
-const MODEL_FILES = ['cherry-tree', 'cat'];
+const MODEL_FILES = ['cherry-tree', 'cat', 'koi'];
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get('seed')) || 3;
 const RENDER_HEIGHT = 300;      // internal resolution in pixels; lower = chunkier
@@ -442,7 +448,7 @@ const loadScript = (src) => new Promise((resolve) => {
 });
 
 let current = null;                            // { object, update, bounds }
-const frame = { target: new THREE.Vector3(), dist: 10, rise: 0 };
+const frame = { target: new THREE.Vector3(), dist: 10, rise: 0, turn: 0 };
 
 function disposeModel(object) {
   object.traverse((o) => {
@@ -456,7 +462,9 @@ function disposeModel(object) {
 
 function resetView() {
   controls.target.copy(frame.target);
-  camera.position.set(frame.target.x, frame.target.y + frame.rise, frame.target.z + frame.dist);
+  camera.position.set(
+    frame.target.x + Math.sin(frame.turn) * frame.dist, frame.target.y + frame.rise,
+    frame.target.z + Math.cos(frame.turn) * frame.dist);
   controls.update();
 }
 
@@ -485,14 +493,17 @@ function showModel(name) {
   frame.target.set(mid.x, top * 0.5, mid.z);
   // a model can adjust its opening view: `back` steps the camera away (1 = snug fit),
   // `rise` sets its height against the model's middle, as a share of the model's height
-  // (the default sits a little below, looking slightly up)
-  const view = { back: 1, rise: -0.12, ...current.view };
+  // (the default sits a little below, looking slightly up), `turn` swings it round the
+  // model, in radians
+  const view = { back: 1, rise: -0.12, turn: 0, ...current.view };
   frame.dist = (fit * 1.05 + radius * 0.4) * view.back;
   frame.rise = top * view.rise;
+  frame.turn = view.turn;
   controls.minDistance = Math.max(1, radius * 0.6);
   controls.maxDistance = Math.max(24, frame.dist * 1.6);
 
-  shadow.scale.setScalar(radius * 0.95);
+  // round, unless the model gives the half-widths of its own footprint
+  shadow.scale.set(current.shadow?.x ?? radius * 0.95, current.shadow?.z ?? radius * 0.95, 1);
   shadow.position.set(mid.x, 0.03, mid.z);
 
   const width = controls.maxDistance * 2 + 6, height = Math.max(16, top * 2);  // the camera stays inside
@@ -501,10 +512,37 @@ function showModel(name) {
   floorTex.repeat.setScalar(width / TILE);
 
   resetView();
+  listVariants(name);
   picker.value = name;
   document.title = `${def.label || name} · Model Viewer`;
   remember('viewer-model', name);
 }
+
+// variants of the model on show: the second picker, the V key, or ?variant= in the URL;
+// the choice is remembered for each model
+const variantPicker = document.getElementById('variant');
+let urlVariant = params.get('variant');
+function setVariant(name) {
+  current.setVariant(name);
+  variantPicker.value = name;
+  remember(`viewer-variant-${picker.value}`, name);
+}
+function listVariants(model) {
+  const variants = current.variants || [];
+  variantPicker.replaceChildren(...variants.map((v) => new Option(v.label || v.name, v.name)));
+  variantPicker.hidden = !variants.length;
+  variantPicker.setAttribute('aria-label', current.variantLabel || 'Variant');
+  if (!variants.length) return;
+  const wanted = urlVariant || recall(`viewer-variant-${model}`);
+  urlVariant = null;
+  picker.value = model;
+  setVariant(variants.some((v) => v.name === wanted) ? wanted : variants[0].name);
+}
+function nextVariant() {
+  const n = variantPicker.options.length;
+  if (n) setVariant(variantPicker.options[(variantPicker.selectedIndex + 1) % n].value);
+}
+variantPicker.addEventListener('change', () => { setVariant(variantPicker.value); variantPicker.blur(); });
 
 const picker = document.getElementById('model');
 picker.addEventListener('change', () => { showModel(picker.value); picker.blur(); });
@@ -520,12 +558,13 @@ if (registry.size) {
 }
 
 addEventListener('keydown', (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey || e.target === picker) return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target === picker || e.target === variantPicker) return;
   const key = e.key.toLowerCase();
   if (key === 'c') setCrt(!crtIsOn());
   if (key === 'b') setEnv(env === 'room' ? 'outdoors' : 'room');
   if (key === 's') setSpin(!controls.autoRotate);
   if (key === 'r') resetView();
+  if (key === 'v') nextVariant();
 });
 
 // ------------------------------------------------------------------- loop
