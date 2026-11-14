@@ -146,7 +146,11 @@ function cutoutTexture(ctx, w, h) {
   return t;
 }
 
-// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly.
+// Kept gentle: the patches span only the middle of the greens and blend smoothly from
+// one to the next, and the blade strokes are laid on half see-through, so the lawn
+// reads as one soft field rather than as dark blotches. Its draws from `rand` stay the
+// same in number and order (index.html grows its tree from the same stream).
 const GRASS_SIZE = 64;
 const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
   const G = 8, grid = Array.from({ length: G * G }, () => rand());
@@ -156,22 +160,27 @@ const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
     const L = THREE.MathUtils.lerp;
     return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
   };
-  const greens = PALETTE.grass;
+  const greens = PALETTE.grass.map((c) => new THREE.Color(c)), shade = new THREE.Color();
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const n = patch(x, y) + rr(-0.16, 0.16);
-    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    const n = 0.5 + 0.55 * (patch(x, y) - 0.5) + 0.3 * rr(-0.16, 0.16);   // squeezed toward the middle
+    const t = THREE.MathUtils.clamp(0.4 + 3.4 * n, 0, greens.length - 1.001);   // about the second green to the fourth
+    const i = Math.floor(t);
+    ctx.fillStyle = '#' + shade.lerpColors(greens[i], greens[i + 1], t - i).getHexString();
     ctx.fillRect(x, y, 1, 1);
   }
   const blades = PALETTE.grassBlades;
   for (let i = 0; i < 520; i++) {
     let x = (rand() * w) | 0, y = (rand() * h) | 0;
     const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
-    ctx.fillStyle = pick(blades);
+    const colour = pick(blades);
+    ctx.fillStyle = colour;
+    ctx.globalAlpha = blades.indexOf(colour) >= 3 ? 0.3 : 0.45;           // the two shadows, fainter still
     for (let k = 0; k < len; k++) {
       ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
       y -= 1; if (k % 2 === 1) x += lean;
     }
   }
+  ctx.globalAlpha = 1;
 });
 
 // Texture sizes follow PS2 practice: a main object gets about one 128x128 sheet's

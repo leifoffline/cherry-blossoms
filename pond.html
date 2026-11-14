@@ -199,7 +199,11 @@ function cutoutTexture(ctx, w, h) {
   return t;
 }
 
-// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly.
+// Kept gentle: the patches span only the middle of the greens and blend smoothly from
+// one to the next, and the blade strokes are laid on half see-through, so the lawn
+// reads as one soft field rather than as dark blotches. Its draws from `rand` stay the
+// same in number and order (index.html grows its tree from the same stream).
 const GRASS_SIZE = 64;
 const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
   const G = 8, grid = Array.from({ length: G * G }, () => rand());
@@ -209,22 +213,27 @@ const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
     const L = THREE.MathUtils.lerp;
     return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
   };
-  const greens = PALETTE.grass;
+  const greens = PALETTE.grass.map((c) => new THREE.Color(c)), shade = new THREE.Color();
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const n = patch(x, y) + rr(-0.16, 0.16);
-    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    const n = 0.5 + 0.55 * (patch(x, y) - 0.5) + 0.3 * rr(-0.16, 0.16);   // squeezed toward the middle
+    const t = THREE.MathUtils.clamp(0.4 + 3.4 * n, 0, greens.length - 1.001);   // about the second green to the fourth
+    const i = Math.floor(t);
+    ctx.fillStyle = '#' + shade.lerpColors(greens[i], greens[i + 1], t - i).getHexString();
     ctx.fillRect(x, y, 1, 1);
   }
   const blades = PALETTE.grassBlades;
   for (let i = 0; i < 520; i++) {
     let x = (rand() * w) | 0, y = (rand() * h) | 0;
     const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
-    ctx.fillStyle = pick(blades);
+    const colour = pick(blades);
+    ctx.fillStyle = colour;
+    ctx.globalAlpha = blades.indexOf(colour) >= 3 ? 0.3 : 0.45;           // the two shadows, fainter still
     for (let k = 0; k < len; k++) {
       ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
       y -= 1; if (k % 2 === 1) x += lean;
     }
   }
+  ctx.globalAlpha = 1;
 });
 
 // sky: blue gradient with wispy clouds, painted once from layered noise; 256 wide, the
@@ -410,20 +419,20 @@ const TEXEL = 0.1;                             // world size of one grass pixel
   scene.add(new THREE.Mesh(band(ringOf(1, 0), far, GRASS_SIZE * TEXEL), psx(new THREE.MeshLambertMaterial({ map: grassTex }))));
 }
 
-// the bed: rounded stones on a darker floor, already tinted as if seen through
-// water; the water sheets above deepen it toward the middle
-const pebbleTex = canvasTexture(64, 64, (ctx, w, h) => {
+// the bed: a darker floor of silt and grit, already tinted as if seen through
+// water; the water sheets above deepen it toward the middle. The stones lying on it
+// are real ones (see bed stones, after the rocks).
+const bedTex = canvasTexture(64, 64, (ctx, w, h) => {
   const floor = PALETTE.bedFloor;
   for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) { ctx.fillStyle = pick(floor); ctx.fillRect(x, y, 2, 2); }
-  const stones = PALETTE.bedStones;
-  for (let i = 0; i < 30; i++) {
-    const cx = rr(0, w), cy = rr(0, h), rx = rr(1.6, 4.6), ry = rx * rr(0.6, 1), light = pick(stones), dark = PALETTE.bedShade;
-    for (let y = -6; y <= 6; y++) for (let x = -6; x <= 6; x++) {
-      const d = (x / rx) ** 2 + (y / ry) ** 2;
-      if (d > 1) continue;
-      ctx.fillStyle = d > 0.6 && x + y > 0 ? dark : light;       // a shaded lower-right edge
-      ctx.fillRect((((cx + x) | 0) + w) % w, (((cy + y) | 0) + h) % h, 1, 1);
-    }
+  // Stones were painted here once; their draws from `rand` are still taken, five
+  // for each of thirty, so the caustics, bank and everything else drawn after keep
+  // their patterns
+  for (let i = 0; i < 30 * 5; i++) rand();
+  const gritRand = mulberry32(SEED + 202), grit = [...PALETTE.bedStones, PALETTE.bedShade];
+  for (let i = 0; i < 220; i++) {               // grit: single specks, light and dark
+    ctx.fillStyle = grit[(gritRand() * grit.length) | 0];
+    ctx.fillRect((gritRand() * w) | 0, (gritRand() * h) | 0, 1, 1);
   }
 });
 const bankTex = canvasTexture(16, 16, (ctx) => {
@@ -432,7 +441,7 @@ const bankTex = canvasTexture(16, 16, (ctx) => {
   ctx.fillStyle = PALETTE.bankMoss;             // moss along the top
   for (let x = 0; x < 16; x++) ctx.fillRect(x, 0, 1, 1 + ((rand() * 3) | 0));
 });
-scene.add(new THREE.Mesh(sheet(ringOf(0.9, -DEPTH), 6), psx(new THREE.MeshBasicMaterial({ map: pebbleTex }))));
+scene.add(new THREE.Mesh(sheet(ringOf(0.9, -DEPTH), 6), psx(new THREE.MeshBasicMaterial({ map: bedTex }))));
 scene.add(new THREE.Mesh(band(ringOf(0.9, -DEPTH), ringOf(1, 0), 0, 26), psx(new THREE.MeshBasicMaterial({ map: bankTex, side: THREE.DoubleSide }))));
 
 // ------------------------------------------------------------------- water
@@ -669,7 +678,9 @@ const ROCK_TINTS = PALETTE.rockTints;
 // One rock: a ball pushed in and out by smooth noise (so the points two faces
 // share move together), squashed to `size`, cut flat underneath, and standing
 // with its base at `at`. `detail` 0 is a 20-sided pebble, 1 an 80-sided boulder.
-function rockGeometry(detail, size, at, tintName) {
+// Its shape is drawn from `random` (the rocks' stream unless another is given).
+function rockGeometry(detail, size, at, tintName, random = rockRand) {
+  const rk = (a, b) => a + (b - a) * random();
   const g = new THREE.IcosahedronGeometry(1, detail), p = g.attributes.position, n = p.count;
   const o = [rk(0, 60), rk(0, 60), rk(0, 60)], turn = rk(0, TAU), cosT = Math.cos(turn), sinT = Math.sin(turn);
   const BASE = 0.45;                           // how far below its middle the rock is cut off
@@ -756,6 +767,38 @@ const boulders = [];                           // footprints { x, z, r }, so the
   scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshLambertMaterial({ map: rockTex, vertexColors: true }))));
 }
 
+// ------------------------------------------------------------- bed stones
+// Real stones on the bottom of the pond, made as the bank pebbles are (rockGeometry)
+// but flatter, as water-worn stones are, and tinted the blue-green of the painted
+// bed so they look seen through the water. They lie in loose drifts with odd
+// strays between, more toward the edges where they would have rolled down the bank,
+// half sunk in the silt, and never on top of one another. They are placed and
+// shaped from their own stream, so the bank and gravel pebbles keep their shapes.
+{
+  const bedRand = mulberry32(SEED + 203), bd = (a, b) => a + (b - a) * bedRand();
+  const tints = PALETTE.bedStones, laid = [], parts = [];
+  const place = (k, a, r) => {
+    const p = rim(a, k);
+    if (laid.some((s) => Math.hypot(s.x - p.x, s.z - p.y) < (s.r + r) * 0.9)) return;
+    laid.push({ x: p.x, z: p.y, r });
+    const size = new THREE.Vector3(r * bd(1, 1.35), r * bd(0.4, 0.6), r);
+    const stone = rockGeometry(0, size, new THREE.Vector3(p.x, -DEPTH - size.y * 0.25, p.y), tints[(bedRand() * tints.length) | 0], bedRand);
+    // a little brighter than the tint alone: the rock texture is a grey that darkens it
+    const colour = stone.attributes.color;
+    for (let i = 0; i < colour.array.length; i++) colour.array[i] *= 1.25;
+    parts.push(stone);
+  };
+  const size = () => 0.14 + 0.28 * bedRand() ** 1.6 + (bedRand() < 0.05 ? 0.2 : 0);   // mostly small, the odd big one
+  for (let drift = 0; drift < 34; drift++) {    // drifts, leaning toward the edge of the bed
+    const a = bd(0, TAU), k = 0.86 - 0.7 * bedRand() ** 2;
+    for (let i = 0; i < 9; i++) place(Math.min(0.87, k + bd(-0.07, 0.07)), a + bd(-0.08, 0.08), size());
+  }
+  for (let i = 0; i < 70; i++) place(0.87 * Math.sqrt(bedRand()), bd(0, TAU), size());   // strays
+  const geometry = mergeGeometries(parts);
+  parts.forEach((g) => g.dispose());
+  scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshLambertMaterial({ map: rockTex, vertexColors: true }))));
+}
+
 // ------------------------------------------------------------- landscaping
 // After a rockery pond in a garden: a wide bed of sand and gravel round the water,
 // scattered with little stones, rounded shrubs standing along its outer edge and
@@ -807,6 +850,63 @@ const gravelTex = canvasTexture(64, 64, (ctx, w, h) => {
   scene.add(new THREE.Mesh(band(ringOf(1, 0.012), outer, 3.2), psx(new THREE.MeshLambertMaterial({
     map: gravelTex, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
   }))));
+
+  // The gravel does not stop at a line: a fringe of the same gravel runs on out over
+  // the lawn, fading from solid to clear through its vertex alpha, as PS2 games
+  // blended one ground into another. A patchy mask breaks the fade up so the gravel
+  // thins out in clumps and specks rather than as an even blur, and the fringe's own
+  // outer edge wanders, wider in some places than others. It is cut four times finer
+  // than the bed for that wander; its inner edge follows the bed's straight segments
+  // exactly, so no lawn shows between them. Its randomness has its own stream, so
+  // the landscaping placed after it stays where it was.
+  const FINE = 4;
+  const inner = [], fringeOuter = [];
+  for (let i = 0; i < SEG * FINE; i++) {
+    const a = (i / (SEG * FINE)) * TAU;
+    const j = Math.floor(i / FINE), f = (i % FINE) / FINE;
+    inner.push(outer[j].clone().lerp(outer[(j + 1) % SEG], f));
+    const width = 0.55 + 0.35 * Math.sin(7 * a + 1.3) + 0.25 * Math.sin(17 * a + 0.2) + 0.15 * Math.sin(31 * a + 4.1);
+    const p = around(a, gravelOut(a) + Math.max(0.3, width));
+    fringeOuter.push(new THREE.Vector3(p.x, 0.012, p.y));
+  }
+  const fringe = band(inner, fringeOuter, 3.2);
+  const fade = [];
+  for (let i = 0; i <= inner.length; i++) fade.push(1, 1, 1, 1, 1, 1, 1, 0);      // inner edge solid, outer clear
+  fringe.setAttribute('color', new THREE.Float32BufferAttribute(fade, 4));
+  const maskRand = mulberry32(SEED + 919);
+  const fringeMask = canvasTexture(32, 32, (ctx, w, h) => {
+    ctx.fillStyle = '#8c8c8c';                 // a middling ground, thinned and thickened below
+    ctx.fillRect(0, 0, w, h);
+    for (let i = 0; i < 26; i++) {             // clumps where the gravel holds on, gaps where it gives out
+      const x = maskRand() * w, y = maskRand() * h, r = 2 + maskRand() * 5, v = maskRand() < 0.55 ? 255 : 40;
+      for (const dx of [-w, 0, w]) for (const dy of [-h, 0, h]) {   // drawn round the wrap so it tiles
+        const g = ctx.createRadialGradient(x + dx, y + dy, 0, x + dx, y + dy, r);
+        g.addColorStop(0, `rgba(${v},${v},${v},0.8)`); g.addColorStop(1, `rgba(${v},${v},${v},0)`);
+        ctx.fillStyle = g; ctx.fillRect(x + dx - r, y + dy - r, r * 2, r * 2);
+      }
+    }
+    for (let i = 0; i < 90; i++) {             // single stones strayed out onto the grass
+      const v = maskRand() < 0.6 ? 255 : 0;
+      ctx.fillStyle = `rgb(${v},${v},${v})`;
+      ctx.fillRect((maskRand() * w) | 0, (maskRand() * h) | 0, 1, 1);
+    }
+  });
+  const fringeMaterial = psx(new THREE.MeshLambertMaterial({
+    map: gravelTex, alphaMap: fringeMask, vertexColors: true, transparent: true, depthWrite: false,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+  }));
+  // The mask is not simply multiplied in: that would leave the inner edge half clear,
+  // a line of its own. Instead it pushes the fade earlier or later, so the fringe is
+  // solid where it meets the bed, clear at its outer edge, and patchy in between.
+  const psxShader = fringeMaterial.onBeforeCompile;
+  fringeMaterial.onBeforeCompile = (shader, renderer) => {
+    psxShader(shader, renderer);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <alphamap_fragment>', /* glsl */`
+      float clumps = texture2D( alphaMap, vAlphaMapUv ).g;
+      diffuseColor.a = smoothstep( 0.0, 1.0, vColor.a * 1.9 - 0.6 + ( clumps - 0.55 ) * 1.2 );`);
+  };
+  fringeMaterial.customProgramCacheKey = () => 'psx-fringe';
+  scene.add(new THREE.Mesh(fringe, fringeMaterial));
 }
 
 // Shrubs, corkscrew rushes and Japanese irises, all made as the cherry tree's

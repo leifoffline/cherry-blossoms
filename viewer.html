@@ -26,7 +26,7 @@
     color: var(--ink); background: var(--panel); border: 1px solid var(--ink); border-radius: 3px;
     opacity: 0.7; cursor: pointer;
   }
-  .bar option { color: #000; background: #fff; }
+  .bar option, .bar optgroup { color: #000; background: #fff; }
   .bar button:hover, .bar button:focus-visible, .bar select:hover, .bar select:focus-visible { opacity: 1; }
 </style>
 <script type="importmap">
@@ -45,18 +45,19 @@
 </div>
 <div class="bar" id="right">
   <button id="env" type="button">BG: outdoors</button>
+  <button id="walk" type="button" aria-pressed="false" hidden>WALK: off</button>
   <button id="spin" type="button" aria-pressed="false">SPIN: off</button>
   <button id="bloom" type="button" aria-pressed="true">BLOOM: on</button>
   <button id="crt" type="button" aria-pressed="true">CRT: on</button>
 </div>
-<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · G bloom · S spin · R reset view · V next variant</div>
+<div id="hint">drag to orbit · right-drag to pan · scroll to zoom<br>B background · C CRT · G bloom · S spin · W walk · R reset view · V next variant</div>
 <script type="module">
 // Viewing environment for models built with the low-poly renderer from index.html.
 //
 // To add a model: write models/<name>.js (see models/cherry-tree.js for the shape of
-// one) and add <name> to MODEL_FILES below. It then shows up in the picker, and can be
-// opened directly with viewer.html?model=<name>. Other URL options: ?env=room or
-// ?env=outdoors, ?crt=off, ?bloom=off, ?spin=on, ?seed=12, ?variant=<name>.
+// one) and add <name> to one of the groups in MODEL_FILES below. It then shows up in
+// that section of the picker, and can be opened directly with viewer.html?model=<name>. Other URL options: ?env=room or
+// ?env=outdoors, ?crt=off, ?bloom=off, ?spin=on, ?walk=on, ?seed=12, ?variant=<name>.
 //
 // A model that comes in several versions (see models/koi.js) returns `variants`, a
 // list of { name, label }, and `setVariant(name)`; they get a second picker.
@@ -66,7 +67,13 @@ import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
-const MODEL_FILES = ['cherry-tree', 'cat', 'koi', 'firefly', 'stone-lantern'];
+// The picker is in two sections: models, the characters that move (and the cat, the
+// first, is what opens when nothing else has been chosen), and objects, which stand
+// still
+const MODEL_FILES = {
+  Models: ['cat', 'koi', 'firefly'],
+  Objects: ['cherry-tree', 'stone-lantern'],
+};
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get('seed')) || 3;
 // The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
@@ -168,7 +175,11 @@ function cutoutTexture(ctx, w, h) {
   return t;
 }
 
-// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly.
+// Kept gentle: the patches span only the middle of the greens and blend smoothly from
+// one to the next, and the blade strokes are laid on half see-through, so the lawn
+// reads as one soft field rather than as dark blotches. Its draws from `rand` stay the
+// same in number and order (index.html grows its tree from the same stream).
 const GRASS_SIZE = 64;
 const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
   const G = 8, grid = Array.from({ length: G * G }, () => rand());
@@ -178,22 +189,27 @@ const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
     const L = THREE.MathUtils.lerp;
     return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
   };
-  const greens = PALETTE.grass;
+  const greens = PALETTE.grass.map((c) => new THREE.Color(c)), shade = new THREE.Color();
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const n = patch(x, y) + rr(-0.16, 0.16);
-    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    const n = 0.5 + 0.55 * (patch(x, y) - 0.5) + 0.3 * rr(-0.16, 0.16);   // squeezed toward the middle
+    const t = THREE.MathUtils.clamp(0.4 + 3.4 * n, 0, greens.length - 1.001);   // about the second green to the fourth
+    const i = Math.floor(t);
+    ctx.fillStyle = '#' + shade.lerpColors(greens[i], greens[i + 1], t - i).getHexString();
     ctx.fillRect(x, y, 1, 1);
   }
   const blades = PALETTE.grassBlades;
   for (let i = 0; i < 520; i++) {
     let x = (rand() * w) | 0, y = (rand() * h) | 0;
     const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
-    ctx.fillStyle = pick(blades);
+    const colour = pick(blades);
+    ctx.fillStyle = colour;
+    ctx.globalAlpha = blades.indexOf(colour) >= 3 ? 0.3 : 0.45;           // the two shadows, fainter still
     for (let k = 0; k < len; k++) {
       ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
       y -= 1; if (k % 2 === 1) x += lean;
     }
   }
+  ctx.globalAlpha = 1;
 });
 
 // sky: blue gradient with wispy clouds, painted once from layered noise; 256 wide, the
@@ -306,6 +322,92 @@ const ground = new THREE.Mesh(
 );
 ground.rotation.x = -Math.PI / 2;
 outdoors.add(ground);
+
+// grass tufts: little clumps of blades standing up out of the lawn, each two crossed
+// cut-out cards (static: the wind in psx is shaped for the tree and would sway them
+// by their distance from the middle). The blade picture is painted in greys, dark at the root and light at
+// the tips, and every tuft is tinted with the colour of the lawn just under it, read
+// back from the grass texture, so it grows out of its own patch instead of standing
+// out as a separate green. The cards' normals point straight up, so the lamps light
+// them exactly as they light the ground. They keep clear of the model on show (see
+// clearTufts) and draw from their own stream, leaving the rest of the backdrop as it was.
+const tuftTex = canvasTexture(16, 16, (ctx) => {
+  const tuftRand = mulberry32(SEED + 4021);
+  for (let i = 0; i < 14; i++) {
+    let x = 1 + ((tuftRand() * 14) | 0);
+    const top = (tuftRand() * 8) | 0, lean = tuftRand() < 0.5 ? -1 : 1, tone = 0.88 + 0.12 * tuftRand();
+    for (let y = 15; y >= top; y--) {
+      const v = Math.round(255 * tone * (0.62 + 0.38 * (15 - y) / (15 - top)));   // root dark, tip light
+      ctx.fillStyle = `rgb(${v},${v},${v})`;
+      ctx.fillRect(Math.min(15, Math.max(0, x)), y, y > 10 ? 2 : 1, 1);
+      if ((15 - y) % 4 === 3) x += lean;
+    }
+  }
+}, { cutout: true });
+tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
+const TUFT_REACH = 18;                         // they grow out to here; beyond, the texture carries the lawn
+const tufts = (() => {
+  const tuftRand = mulberry32(SEED + 4022);
+  const spots = [];
+  for (let c = 0; c < 300; c++) {              // in clumps of a few, as grass grows
+    const a = tuftRand() * Math.PI * 2, r = TUFT_REACH * Math.sqrt(tuftRand());
+    const n = 2 + ((tuftRand() * 4) | 0);
+    for (let k = 0; k < n; k++) {
+      const b = tuftRand() * Math.PI * 2, d = 0.4 * tuftRand();
+      spots.push({
+        x: Math.sin(a) * r + Math.sin(b) * d, z: Math.cos(a) * r + Math.cos(b) * d,
+        turn: tuftRand() * Math.PI, width: 0.45 + 0.35 * tuftRand(), height: 0.28 + 0.26 * tuftRand(),
+      });
+    }
+  }
+  const card = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
+  // each card twice, back to back and one-sided: a double-sided material would turn
+  // the up-pointing normals down on the back faces and light them dark
+  const geometry = mergeGeometries([0, 1, 2, 3].map((k) => card.clone().rotateY((k * Math.PI) / 2)));
+  card.dispose();
+  const normals = geometry.attributes.normal;
+  for (let i = 0; i < normals.count; i++) normals.setXYZ(i, 0, 1, 0);
+  const mesh = new THREE.InstancedMesh(geometry,
+    psx(new THREE.MeshLambertMaterial({ map: tuftTex, alphaTest: 0.5 })), spots.length);
+  // the lawn's colour at a spot: the ground's texture coordinates come from the
+  // circle's own (0 to 1 across it), repeated, so a point's texel is its position
+  // over one tile's width, offset by however far the circle's edge falls into a tile;
+  // the canvas is read upside down, as the texture is flipped onto the ground
+  const lawn = grassTex.image.getContext('2d').getImageData(0, 0, GRASS_SIZE, GRASS_SIZE).data;
+  const TILE_W = GRASS_SIZE * TEXEL, edge = GROUND_R / TILE_W;
+  const frac = (v) => v - Math.floor(v);
+  const tint = new THREE.Color(), sum = [0, 0, 0];
+  spots.forEach((spot, i) => {
+    const px = Math.floor(frac(spot.x / TILE_W + edge) * GRASS_SIZE);
+    const py = Math.floor((1 - frac(-spot.z / TILE_W + edge)) * GRASS_SIZE);
+    sum.fill(0);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {   // a little round about, past the blade strokes
+      const j = (((py + dy + GRASS_SIZE) % GRASS_SIZE) * GRASS_SIZE + ((px + dx + GRASS_SIZE) % GRASS_SIZE)) * 4;
+      sum[0] += lawn[j]; sum[1] += lawn[j + 1]; sum[2] += lawn[j + 2];
+    }
+    // a touch lighter than the ground, as blades catch more light than the turf between them
+    tint.setRGB(sum[0] / 9 / 255, sum[1] / 9 / 255, sum[2] / 9 / 255, THREE.SRGBColorSpace).multiplyScalar(1.2);
+    mesh.setColorAt(i, tint);
+  });
+  mesh.userData.spots = spots;
+  mesh.frustumCulled = false;
+  outdoors.add(mesh);
+  return mesh;
+})();
+// lays the tufts out, leaving a clear circle round the model on show (and room for
+// one that walks about) so blades do not grow up through it
+function clearTufts(clear) {
+  const dummy = new THREE.Object3D();
+  tufts.userData.spots.forEach((spot, i) => {
+    const out = Math.hypot(spot.x, spot.z) > clear;
+    dummy.position.set(spot.x, 0, spot.z);
+    dummy.rotation.y = spot.turn;
+    dummy.scale.set(out ? spot.width : 0, out ? spot.height : 0, out ? spot.width : 0);
+    dummy.updateMatrix();
+    tufts.setMatrixAt(i, dummy.matrix);
+  });
+  tufts.instanceMatrix.needsUpdate = true;
+}
 
 {
   const glow = canvasTexture(64, 64, (ctx) => {
@@ -596,6 +698,20 @@ const loadScript = (src) => new Promise((resolve) => {
 });
 
 let current = null;                            // { object, update, bounds }
+const shadowBase = new THREE.Vector3();        // where the shadow sits when the model stands at home
+
+// a model that can walk about (it returns setWalking) gets the WALK button: the
+// button, the W key, or ?walk=on in the URL; the choice is remembered
+const walkButton = document.getElementById('walk');
+let walkOn = (params.get('walk') || recall('viewer-walk')) === 'on';
+function setWalk(on) {
+  walkOn = on;
+  walkButton.textContent = on ? 'WALK: on' : 'WALK: off';
+  walkButton.setAttribute('aria-pressed', String(on));
+  remember('viewer-walk', on ? 'on' : 'off');
+  current?.setWalking?.(on);
+}
+walkButton.addEventListener('click', () => setWalk(!walkOn));
 const frame = { target: new THREE.Vector3(), dist: 10, rise: 0, turn: 0 };
 
 function disposeModel(object) {
@@ -657,6 +773,10 @@ function showModel(name) {
   // round, unless the model gives the half-widths of its own footprint
   shadow.scale.set(current.shadow?.x ?? radius * 0.95, current.shadow?.z ?? radius * 0.95, 1);
   shadow.position.set(mid.x, Math.min(0.03, top * 0.02), mid.z);     // just clear of the floor, at the model's own scale
+  shadowBase.copy(shadow.position);
+  // grass keeps off the model's footprint; a model that walks about (the cat wanders
+  // up to 2.5 from the middle) needs that much more room
+  clearTufts(radius * 1.15 + (current.setWalking ? 2.8 : 0));
 
   const width = controls.maxDistance * 2 + 6, height = Math.max(16, top * 2);  // the camera stays inside
   room.scale.set(width, height, width);
@@ -665,6 +785,8 @@ function showModel(name) {
 
   resetView();
   listVariants(name);
+  walkButton.hidden = !current.setWalking;
+  if (current.setWalking) setWalk(walkOn);
   picker.value = name;
   document.title = `${def.label || name} · Model Viewer`;
   remember('viewer-model', name);
@@ -699,14 +821,22 @@ variantPicker.addEventListener('change', () => { setVariant(variantPicker.value)
 const picker = document.getElementById('model');
 picker.addEventListener('change', () => { showModel(picker.value); picker.blur(); });
 
-for (const file of MODEL_FILES) await loadScript(`models/${file}.js`);
-for (const def of registry.values()) picker.add(new Option(def.label || def.name, def.name));
+for (const [section, files] of Object.entries(MODEL_FILES)) {
+  const group = document.createElement('optgroup');
+  group.label = section;
+  for (const file of files) {
+    const before = new Set(registry.keys());
+    await loadScript(`models/${file}.js`);
+    for (const [name, def] of registry) if (!before.has(name)) group.append(new Option(def.label || name, name));
+  }
+  if (group.children.length) picker.append(group);
+}
 if (registry.size) {
   const wanted = params.get('model') || recall('viewer-model');
   showModel(registry.has(wanted) ? wanted : registry.keys().next().value);
   if (hint.className !== 'error') setTimeout(() => { hint.style.opacity = 0; }, 6000);
 } else if (hint.className !== 'error') {
-  fail('no models: add one to MODEL_FILES in viewer.html');
+  fail('no models: add one to a group in MODEL_FILES in viewer.html');
 }
 
 addEventListener('keydown', (e) => {
@@ -716,6 +846,7 @@ addEventListener('keydown', (e) => {
   if (key === 'g') setBloom(!bloomIsOn());
   if (key === 'b') setEnv(env === 'room' ? 'outdoors' : 'room');
   if (key === 's') setSpin(!controls.autoRotate);
+  if (key === 'w' && current?.setWalking) setWalk(!walkOn);
   if (key === 'r') resetView();
   if (key === 'v') nextVariant();
 });
@@ -728,6 +859,10 @@ renderer.setAnimationLoop(() => {
   time += dt;
   shared.uTime.value = time;
   current?.update?.(dt, time);
+  if (current) {                               // the shadow keeps under a model that walks about
+    shadow.position.x = shadowBase.x + current.object.position.x;
+    shadow.position.z = shadowBase.z + current.object.position.z;
+  }
   controls.update();
   sky.position.copy(camera.position);
   renderer.setRenderTarget(sceneRT);

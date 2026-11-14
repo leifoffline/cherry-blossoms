@@ -8,6 +8,10 @@
 // flapping, head tipped out of its way), ears down (the ears fold out flat to the
 // sides and the head hangs), and sleeping (on his back with his arms crossed on his
 // chest and one leg resting over the other knee, ears down, Zs drifting up).
+//
+// Walking (setWalking, the viewer's WALK toggle) is separate from the poses: he
+// wanders the floor, stopping now and then, in whichever pose he is in, apart from
+// sleeping, when he lies down where he stands.
 registerModel({
   name: 'cat',
   label: 'Cat',
@@ -444,22 +448,111 @@ registerModel({
     }
     const hipAt = V(), kneeAt = V(), reach = V(), forward = V(), FRONT = V(0, 0, 1);
 
+    // --------------------------------------------------------------- walking
+    // With walking on (the viewer's WALK toggle) he wanders the floor: stands a few
+    // seconds, turns toward a new spot, walks there and stops again. Switched off, he
+    // walks back to the middle and turns to face the front. Only the whole cat moves
+    // and turns (the root group); the steps are laid over the idle.
+    //
+    // His legs are short and straight at rest, so he walks with small quick steps and
+    // his hips let down a little (WALK_SQUAT), or a foot reaching forward would pull
+    // the leg out of its hip. One gait cycle carries him STRIDE; each foot spends half
+    // of it planted, sliding back under him at his own speed so that it stays put on
+    // the floor, and half swinging forward through the air.
+    const WALK_SPEED = 1.2;                      // units a second, about a body height every four
+    const STRIDE = 0.9;
+    const STEP = STRIDE / 4;                     // how far a foot reaches in front of or behind the ankle
+    const LIFT = 0.22;
+    const WALK_SQUAT = 0.12;
+    const WANDER_R = 2.5;                        // keeps him in the opening frame
+    const TURN_RATE = 2.6;                       // radians a second
+    let walking = false, heading = 0, speed = 0, gait = 0, stepping = 0;
+    const wander = { mode: 'pause', wait: 1, target: V() };
+    const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+    function setWalking(on) {
+      walking = !!on;
+      if (walking) { wander.mode = 'pause'; wander.wait = 0.5; }
+      else { wander.target.set(0, 0, 0); wander.mode = 'turn'; }   // home
+    }
+    function turnToward(aim, dt) {               // returns how far there is still to turn
+      const err = wrap(aim - heading);
+      const step = Math.max(-TURN_RATE * dt, Math.min(TURN_RATE * dt, err));
+      heading = wrap(heading + step);
+      return { err: err - step, rate: dt > 0 ? Math.abs(step) / dt : 0 };
+    }
+    function roam(dt) {
+      const at = cat.position;
+      let want = 0, turning = 0;
+      if (wander.mode === 'pause') {
+        if (!walking) turning = turnToward(0, dt).rate;            // home: face the front
+        else if ((wander.wait -= dt) <= 0) {
+          // somewhere new, not too close to where he stands
+          for (let i = 0; i < 12; i++) {
+            const a = Math.random() * Math.PI * 2, r = WANDER_R * Math.sqrt(Math.random());
+            wander.target.set(Math.sin(a) * r, 0, Math.cos(a) * r);
+            if (wander.target.distanceTo(at) > 1.5) break;
+          }
+          wander.mode = 'turn';
+        }
+      } else {
+        const dx = wander.target.x - at.x, dz = wander.target.z - at.z, dist = Math.hypot(dx, dz);
+        if (dist < 0.08) {
+          wander.mode = 'pause';
+          wander.wait = 2 + Math.random() * 3;
+        } else {
+          const turn = turnToward(Math.atan2(dx, dz), dt);
+          turning = turn.rate;
+          if (wander.mode === 'turn' && Math.abs(turn.err) < 0.3) wander.mode = 'go';
+          if (wander.mode === 'go') want = WALK_SPEED * Math.min(1, dist / 0.8);   // slows as he comes in
+        }
+      }
+      speed += (want - speed) * (1 - Math.exp(-dt * 4));
+      at.x += Math.sin(heading) * speed * dt;
+      at.z += Math.cos(heading) * speed * dt;
+      cat.rotation.y = heading;
+      // turning on the spot also takes steps, so his feet don't twist on the floor.
+      // Slower, the steps get shorter (`stepping` scales them) and come quicker to
+      // match, so a planted foot still moves back exactly as fast as he goes forward.
+      const effort = Math.min(1, (speed + 0.5 * turning) / WALK_SPEED);
+      stepping += (effort - stepping) * (1 - Math.exp(-dt * 6));
+      gait = (gait + dt * Math.max(speed, 0.5 * turning) / (STRIDE * Math.max(stepping, 0.3))) % 1;
+    }
+    // where a foot is along its cycle `p` (0 to 1): planted from 0 to a half, sliding
+    // from in front to behind, then lifted and swung forward again
+    const footOffset = V();
+    function footAt(p) {
+      if (p < 0.5) return { z: STEP * (1 - 4 * p), y: 0, swing: -1 };
+      const s = (p - 0.5) * 2, e = s * s * (3 - 2 * s);
+      return { z: STEP * (-1 + 2 * e), y: LIFT * Math.sin(Math.PI * s), swing: s };
+    }
+
     function update(dt, time) {
       if (pose === 'sleep') return sleep(dt, time);
       now = time;
+      roam(dt);
+      const w = stepping, still = 1 - w;
       const phase = time * BOB;
       const beat = Math.sin(phase);
+      const g = gait * Math.PI * 2;
 
-      // torso: sinks and rises on the knees, shifting its weight from side to side
+      // torso: sinks and rises on the knees, shifting its weight from side to side;
+      // walking, it lets down, dips at each footfall, leans over the planted foot and
+      // twists a little against the stride
       torso.position.copy(torso.userData.rest);
-      torso.position.y += -0.055 + 0.03 * beat;
-      torso.position.x += 0.035 * Math.sin(phase * 0.5);
-      torso.rotation.z = -0.025 * Math.sin(phase * 0.5);
+      torso.position.y += (-0.055 + 0.03 * beat) * still + (-WALK_SQUAT - 0.03 * Math.cos(2 * g)) * w;
+      torso.position.x += 0.035 * Math.sin(phase * 0.5) * still + SIDES[0] * 0.05 * Math.sin(g) * w;
+      torso.rotation.set(0.04 * w, 0.07 * Math.cos(g) * w, -0.025 * Math.sin(phase * 0.5) * still + SIDES[0] * 0.03 * Math.sin(g) * w);
 
-      // legs: bend each knee forward by whatever the leg has to spare
-      for (const leg of legs) {
+      // legs: put each foot where its step has it (planted at rest), then bend the knee
+      // forward by whatever the leg has to spare
+      legs.forEach((leg, i) => {
+        const foot = footAt((gait + i / 2) % 1);
+        footOffset.set(0, foot.y * w, foot.z * w);
+        const ankleAt = footOffset.add(leg.ankle);
+        leg.foot.position.copy(ankleAt);
+        leg.foot.rotation.x = foot.swing < 0 ? 0 : 0.35 * Math.sin(Math.PI * 2 * foot.swing) * w;  // toes push off, then lift
         hipAt.copy(leg.hip).applyEuler(torso.rotation).add(torso.position);
-        reach.subVectors(leg.ankle, hipAt);
+        reach.subVectors(ankleAt, hipAt);
         const half = Math.min(reach.length() / 2, leg.bone);
         reach.normalize();
         forward.copy(FRONT).addScaledVector(reach, -FRONT.dot(reach)).normalize();
@@ -467,24 +560,27 @@ registerModel({
         leg.thigh.position.copy(hipAt);
         leg.thigh.quaternion.setFromUnitVectors(leg.along, reach.subVectors(kneeAt, hipAt).normalize());
         leg.shin.position.copy(kneeAt);
-        leg.shin.quaternion.setFromUnitVectors(leg.along, reach.subVectors(leg.ankle, kneeAt).normalize());
-      }
+        leg.shin.quaternion.setFromUnitVectors(leg.along, reach.subVectors(ankleAt, kneeAt).normalize());
+      });
 
       // head: bobs a beat behind the body, nods a little and tips from side to side
-      head.position.y = head.userData.rest.y + 0.045 * Math.sin(phase - 0.6);
-      head.rotation.x = 0.03 * Math.sin(phase - 0.9);
-      head.rotation.z = 0.035 * Math.sin(phase * 0.5);
+      head.position.y = head.userData.rest.y + 0.045 * Math.sin(phase - 0.6) * still + 0.03 * Math.cos(2 * g - 0.8) * w;
+      head.rotation.x = 0.03 * Math.sin(phase - 0.9) * still - 0.04 * w;
+      head.rotation.y = -0.07 * Math.cos(g) * w;                  // keeps looking ahead as the body twists
+      head.rotation.z = 0.035 * Math.sin(phase * 0.5) * still;
       if (pose === 'sulk') head.rotation.x += 0.3 * earDown;      // hangs his head as the ears come down
 
       // arms: swing from the shoulder in turn; the elbow and wrist follow a little late,
-      // the elbow only ever bending forward
-      for (const arm of arms) {
+      // the elbow only ever bending forward. Walking, each arm swings against the leg
+      // on its own side, wider and with the elbow more bent.
+      arms.forEach((arm, i) => {
         const swing = (lag) => arm.side * Math.sin(phase - lag);
-        arm.upper.rotation.x = 0.2 * swing(0);
-        arm.upper.rotation.z = arm.side * 0.05 * beat;
-        arm.fore.rotation.x = -0.24 + 0.2 * swing(0.7);
-        arm.paw.rotation.x = 0.25 * swing(1.4);
-      }
+        const stride = (lag) => Math.cos(g + i * Math.PI - lag);   // 1 when this side's foot is furthest forward
+        arm.upper.rotation.x = 0.2 * swing(0) * still + 0.45 * stride(0) * w;
+        arm.upper.rotation.z = arm.side * 0.05 * beat * still;
+        arm.fore.rotation.x = -0.24 + 0.2 * swing(0.7) * still + (-0.2 + 0.15 * stride(0.6)) * w;
+        arm.paw.rotation.x = 0.25 * swing(1.4) * still + 0.2 * stride(1.2) * w;
+      });
 
       if (pose === 'wave') {
         // one arm held out to the side, the forearm flapping up and down from the
@@ -497,8 +593,9 @@ registerModel({
       }
 
       // tail: a slow wave travelling out to the tip
+      // tail: a slow wave travelling out to the tip; walking, it swishes with the stride
       tail.forEach((link, i) => {
-        link.rotation.y = 0.11 * Math.sin(phase * 0.5 - i * 0.6);
+        link.rotation.y = 0.11 * Math.sin(phase * 0.5 - i * 0.6) * still + 0.14 * Math.sin(g - i * 0.6) * w;
         link.rotation.z = 0.05 * Math.sin(phase - i * 0.5);
       });
 
@@ -518,6 +615,9 @@ registerModel({
     update(0, 0);
 
     // his big head fills a snug frame, so start further back and level with him
-    return { object: cat, update, variants: POSES, variantLabel: 'Pose', setVariant, view: { back: 1.35, rise: 0.04 } };
+    return {
+      object: cat, update, variants: POSES, variantLabel: 'Pose', setVariant, view: { back: 1.35, rise: 0.04 },
+      setWalking, walking: () => walking,
+    };
   },
 });
