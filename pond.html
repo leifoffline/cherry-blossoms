@@ -42,20 +42,23 @@
 // wandering under the surface, boulders and pebbles round the rim, and the foliage:
 // lily pads, two stands of reeds and cattails, grass round the banks, and the cherry
 // tree (models/cherry-tree.js) leaning in where the blossom branch was, with the
-// cat (models/cat.js) asleep on his back in its shade. The camera
+// cat (models/cat.js) asleep on his back in its shade. Round it all, a garden: a
+// bed of sand and gravel strewn with little stones, shrubs and flower cushions, and
+// two stone lanterns (models/stone-lantern.js) that are lit after dark. The camera
 // keeps one angle: it opens on a default view of the whole pond, and zooming in
 // lets you slide the view about. The time of day can be changed; so far there is
-// day and sunset. Still to come, one at a time: ducks and ducklings, floating
-// petals, dragonflies, fireflies, the heron and swan, feeding, ripples, the rest of
-// the day (dusk, night, dawn), rain.
+// day, sunset and night, and fireflies (models/firefly.js) come out as it gets
+// dark. Still to come, one at a time: ducks and ducklings, floating petals,
+// dragonflies, the heron and swan, feeding, ripples, the rest of the day (dusk,
+// dawn), rain.
 //
-// URL options: ?crt=off, ?bloom=off, ?time=sunset, ?seed=12.
+// URL options: ?crt=off, ?bloom=off, ?time=sunset or night, ?seed=12.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
-const MODEL_FILES = ['koi', 'cherry-tree', 'cat'];
+const MODEL_FILES = ['koi', 'cherry-tree', 'cat', 'firefly', 'stone-lantern'];
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get('seed')) || 3;
 // The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
@@ -95,6 +98,16 @@ const PALETTE = {
   rockTints: ['#ffffff', '#f8f2e9', '#f0e8d9', '#e9ecf1', '#f6ecdc', '#e2ddd4'], pebbleTints: ['#ffffff', '#dee0e5'],
   // sunset (see time of day): a low orange sun, and water that takes on the colour of the sky
   sunsetSun: 0xff9a52, sunsetWaterDeep: 0x1f4a8c, sunsetWaterSurface: [0xc8708c, 0.24], sunsetCaustics: 0xffcf86, sunsetSky: 0xff9c6a,
+  // night: a high moon, and water gone to dark glass with a thin silver web on it
+  // landscaping: warm sand and gravel, shrubs from a blue shade to a yellow-green top
+  sand: ['#cdb894', '#d6c3a2', '#c4ad8a', '#d1bd9b'], gravel: ['#e8dccb', '#c8a594', '#a7a19a', '#bfae98', '#d9c7b0'], gravelShade: '#8e8073',
+  gravelPebbles: ['#e4d6c4', '#cfb2a2', '#b4aea6', '#d8c9b2', '#c0a48f', '#ece6dc'],
+  // (the leaves are painted pale and take their green from each bunch's tint)
+  bushLeaves: ['#ffffff', '#f2f8e4', '#e2efcf', '#d4e6bd'], bushBack: ['#a9c49a', '#9cb88f'], bushGleam: '#ffffff',
+  bushTints: [0x5c9c56, 0x68a85b, 0x78b462, 0x52904f], bushCore: 0x24402f,
+  cushionLeaves: ['#5e9a52', '#6fa85a', '#4f8a4b', '#82b866'], cushionBack: ['#3e6f45', '#467a4a'], cushionTints: [0xffffff, 0xf2f2ee, 0xe6eae2],
+  flowersPurple: ['#9a6fe4', '#ae88f0', '#c4a3f8'], flowersBlue: ['#6c95ef', '#8db0f6', '#b2cbfb'],
+  nightMoon: 0xa9c2ff, nightWaterDeep: 0x06183a, nightWaterSurface: [0x1b3f7c, 0.3], nightCaustics: 0x9fc4ff, nightSky: 0x1a2658,
 };
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -296,7 +309,8 @@ const PSX_PROJECT_GLSL = /* glsl */`
 // drawn, since much of the scene is unlit and would not answer to the lamps: bright
 // parts are multiplied by one colour and dark parts by another, so a sunset can
 // have orange light and violet shade. psx() applies it; a material that does not go
-// through psx() can be given it alone.
+// through psx() can be given it alone. A material marked `userData.selfLit` is a
+// light of its own (a firefly's glow) and is left as it is.
 function graded(shader) {
   shader.uniforms.uDayLight = shared.uDayLight;
   shader.uniforms.uDayShade = shared.uDayShade;
@@ -316,12 +330,12 @@ function psx(material, windAmount = 0, flex = TREE_FLEX) {
     shader.uniforms.uTime = shared.uTime;
     shader.uniforms.uSnap = shared.uSnap;
     Object.assign(shader.uniforms, uniforms);
-    graded(shader);
+    if (!material.userData.selfLit) graded(shader);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + PSX_GLSL)
       .replace('#include <project_vertex>', PSX_PROJECT_GLSL);
   };
-  material.customProgramCacheKey = () => 'psx';
+  material.customProgramCacheKey = () => (material.userData.selfLit ? 'psx-lit' : 'psx');
   return material;
 }
 
@@ -727,10 +741,179 @@ const boulders = [];                           // footprints { x, z, r }, so the
 // nearer the viewer so the trunk does not hide him. Set here so that the bank grass
 // can keep clear of him.
 const CAT_AT = rim(3.72, 1.22), CAT_SCALE = 0.5, CAT_ROOM = 1.6;
+const TREE_AT = rim(3.85, 1.2);                // the cherry tree's spot (see cherry tree)
+
+// ------------------------------------------------------------- landscaping
+// After a rockery pond in a garden: a wide bed of sand and gravel round the water,
+// scattered with little stones, rounded shrubs standing along its outer edge and
+// behind the far bank, and low cushions of purple and blue flowers spilling over it.
+// Two stone lanterns (models/stone-lantern.js) stand on the banks, one at the left end
+// and one on the far right. It all draws from its own random stream, and
+// records its footprints in `boulders` so the bank grass and the fireflies keep
+// clear of it.
+const landRand = mulberry32(SEED + 303), ld = (a, b) => a + (b - a) * landRand();
+const around = (a, out) => { const edge = rim(a); return edge.add(edge.clone().normalize().multiplyScalar(out)); };
+const angleApart = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+const REED_ANGLES = [2.5, -0.62];
+
+// where the lanterns stand: on the left bank and the far right, just back from the boulders
+const LANTERNS = [[3.14, 2.2, 0.3, 0.5], [5.52, 3.1, -0.35, 0.52]].map(([a, out, turn, scale]) => {
+  const at = around(a, out);
+  boulders.push({ x: at.x, z: at.y, r: 1.9 * scale / 0.5 });
+  return { at, turn, scale };
+});
+
+// the gravel bed: from the water's edge out to a wandering line, widest behind the
+// far bank and narrowest on the near one, so the grass in front still shows
+const gravelOut = (a) => {
+  const reach = 2.8 + 0.7 * Math.sin(3 * a + 0.4) + 0.45 * Math.sin(5 * a + 2.6) + 0.3 * Math.sin(9 * a + 1);
+  return Math.max(1.4, reach * (Math.sin(a) > 0 ? 1 - 0.35 * Math.sin(a) : 1 + 0.3 * -Math.sin(a)));
+};
+const gravelTex = canvasTexture(64, 64, (ctx, w, h) => {
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+    ctx.fillStyle = PALETTE.sand[(landRand() * PALETTE.sand.length) | 0];
+    ctx.fillRect(x, y, 2, 2);
+  }
+  for (let i = 0; i < 70; i++) {               // small stones, each with a shaded lower-right edge
+    const cx = ld(0, w), cy = ld(0, h), rx = ld(1.2, 3), ry = rx * ld(0.6, 1);
+    const light = PALETTE.gravel[(landRand() * PALETTE.gravel.length) | 0];
+    for (let y = -4; y <= 4; y++) for (let x = -4; x <= 4; x++) {
+      const d = (x / rx) ** 2 + (y / ry) ** 2;
+      if (d > 1) continue;
+      ctx.fillStyle = d > 0.55 && x + y > 0 ? PALETTE.gravelShade : light;
+      ctx.fillRect((((cx + x) | 0) + w) % w, (((cy + y) | 0) + h) % h, 1, 1);
+    }
+  }
+});
+{
+  const outer = Array.from({ length: SEG }, (_, i) => {
+    const a = (i / SEG) * TAU, p = around(a, gravelOut(a));
+    return new THREE.Vector3(p.x, 0.012, p.y);
+  });
+  scene.add(new THREE.Mesh(band(ringOf(1, 0.012), outer, 3.2), psx(new THREE.MeshLambertMaterial({
+    map: gravelTex, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+  }))));
+}
+
+// Shrubs and flower cushions, made as the cherry tree's canopy is: each is a cloud
+// of bunches, and each bunch is three crossed squares carrying a cut-out picture of
+// a spray of leaves (or leaves and flowers), turned every which way. The shading is
+// baked into each bunch's colour, darker low down and inside, brighter on top and
+// on the side toward the sun, and a dark dome in the middle keeps the gaps between
+// bunches from showing the ground through.
+//
+// A spray: small leaves on a transparent square, thicker in the middle and ragged
+// at the edge, with darker ones behind; `flowers` scatters five-dot flowers on top.
+// A shrub's leaves are painted pale and take their green from each bunch's colour;
+// a cushion's are painted green, and its bunches only lightly shaded, so that the
+// flowers on it keep their own colour.
+const sprayTex = (flowers) => canvasTexture(64, 64, (ctx) => {
+  const leaf = (x, y, len, colour) => {
+    ctx.fillStyle = colour;
+    ctx.beginPath(); ctx.ellipse(x, y, len, len * 0.45, ld(0, Math.PI), 0, TAU); ctx.fill();
+  };
+  const spot = () => { const a = ld(0, TAU), r = ld(0, 1) ** 0.7 * 27; return [32 + Math.cos(a) * r, 32 + Math.sin(a) * r]; };
+  const back = flowers ? PALETTE.cushionBack : PALETTE.bushBack, front = flowers ? PALETTE.cushionLeaves : PALETTE.bushLeaves;
+  for (let i = 0; i < 26; i++) leaf(...spot(), ld(2.5, 4), back[(landRand() * back.length) | 0]);
+  for (let i = 0; i < 60; i++) {
+    const [x, y] = spot(), len = ld(2.6, 4.2);
+    leaf(x, y, len, front[(landRand() * front.length) | 0]);
+    if (landRand() < 0.4) { ctx.fillStyle = PALETTE.bushGleam; ctx.fillRect(Math.round(x), Math.round(y - len * 0.3), 1, 1); }   // a catch of light
+  }
+  if (!flowers) return;
+  const dot = (x, y) => { ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3); };
+  for (let i = 0; i < 34; i++) {
+    const [fx, fy] = spot(), x = Math.round(fx), y = Math.round(fy), colour = flowers[(landRand() * flowers.length) | 0];
+    const turn = ld(0, TAU);
+    ctx.fillStyle = colour;
+    for (let k = 0; k < 5; k++) dot(Math.round(x + Math.cos(turn + k * 1.2566) * 1.8), Math.round(y + Math.sin(turn + k * 1.2566) * 1.8));
+    ctx.fillStyle = '#f6efd8'; ctx.fillRect(x, y, 1, 1);          // a pale eye
+  }
+}, { cutout: true });
+{
+  const roomFor = (p, r) => p.distanceTo(TREE_AT) > r + 1.6 && p.distanceTo(CAT_AT) > CAT_ROOM + r
+    && !boulders.some((b) => Math.hypot(b.x - p.x, b.z - p.y) < b.r * 0.8 + r * 0.7);
+  const kinds = {
+    shrub: { tex: sprayTex(null), tints: PALETTE.bushTints, bunches: [], cores: [] },
+    purple: { tex: sprayTex(PALETTE.flowersPurple), tints: PALETTE.cushionTints, bunches: [], cores: [] },
+    blue: { tex: sprayTex(PALETTE.flowersBlue), tints: PALETTE.cushionTints, bunches: [], cores: [] },
+  };
+  // one plant: bunches through a dome `r` across and `top` high, most of them near
+  // its surface so it reads as a full, rounded mass
+  const sun = new THREE.Vector2(SUN_DIR.x, SUN_DIR.z).normalize();
+  function plant(kind, x, z, r, top) {
+    const count = Math.round(12 + 24 * r * top);
+    for (let i = 0; i < count; i++) {
+      const a = ld(0, TAU), up = ld(0.05, 1), deep = Math.sqrt(ld(0.35, 1)), side = Math.sqrt(1 - up * up);
+      const p = new THREE.Vector3(x + Math.cos(a) * side * r * deep, Math.max(0.15, up * top * deep), z + Math.sin(a) * side * r * deep);
+      const height = p.y / top, sunny = Math.max(0, Math.cos(a) * sun.x + Math.sin(a) * sun.y) * side;
+      kind.bunches.push({
+        p, s: ld(0.3, 0.42) * Math.min(1.15, 0.55 + r * 0.45),
+        shade: (0.62 + 0.3 * height + 0.18 * sunny) * deep ** 0.4 * ld(0.92, 1.05),
+      });
+    }
+    kind.cores.push(new THREE.SphereGeometry(1, 10, 6, 0, TAU, 0, Math.PI / 2).scale(r * 0.7, top * 0.78, r * 0.7).translate(x, 0, z));
+  }
+  // shrubs: along the outer edge of the gravel and behind the far bank, none on
+  // the near bank, where they would hide the water
+  for (let tries = 0, placed = 0; tries < 200 && placed < 15; tries++) {
+    const a = ld(0, TAU);
+    if (Math.sin(a) > 0.3) continue;
+    const r = ld(0.9, 1.6), p = around(a, gravelOut(a) + ld(-0.4, 1.8));
+    if (!roomFor(p, r)) continue;
+    plant(kinds.shrub, p.x, p.y, r, r * ld(0.95, 1.25));
+    placed++;
+    boulders.push({ x: p.x, z: p.y, r });
+  }
+  // flower cushions: low, anywhere on the gravel, clear of the reeds
+  for (let tries = 0, placed = 0; tries < 200 && placed < 14; tries++) {
+    const a = ld(0, TAU), out = ld(0.7, gravelOut(a) + 0.6);
+    if (REED_ANGLES.some((g) => angleApart(a, g) < 0.3) && out < 1.6) continue;
+    const r = ld(0.55, 1.0), p = around(a, out);
+    if (!roomFor(p, r)) continue;
+    plant(placed % 2 ? kinds.blue : kinds.purple, p.x, p.y, r, r * ld(0.45, 0.6));
+    placed++;
+    boulders.push({ x: p.x, z: p.y, r: r * 0.9 });
+  }
+  const card = new THREE.PlaneGeometry(1, 1);
+  const bunch = mergeGeometries([card, card.clone().rotateY(Math.PI / 2), card.clone().rotateX(Math.PI / 2)]);
+  const dummy = new THREE.Object3D(), colour = new THREE.Color(), WIND = [0, 2.5, 0];
+  for (const kind of Object.values(kinds)) {
+    if (!kind.bunches.length) continue;
+    const mesh = new THREE.InstancedMesh(bunch,
+      psx(new THREE.MeshBasicMaterial({ map: kind.tex, alphaTest: 0.5, side: THREE.DoubleSide }), 0.6, WIND), kind.bunches.length);
+    kind.bunches.forEach(({ p, s, shade }, i) => {
+      dummy.position.copy(p);
+      dummy.rotation.set(ld(0, TAU), ld(0, TAU), ld(0, TAU));
+      dummy.scale.setScalar(s * 2.6);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+      mesh.setColorAt(i, colour.set(kind.tints[(landRand() * kind.tints.length) | 0]).multiplyScalar(shade));
+    });
+    mesh.frustumCulled = false;
+    scene.add(mesh);
+    scene.add(new THREE.Mesh(mergeGeometries(kind.cores), psx(new THREE.MeshBasicMaterial({ color: PALETTE.bushCore }), 0.6, WIND)));
+    kind.cores.forEach((g) => g.dispose());
+  }
+}
+
+// little stones strewn over the gravel, thickest near the water
+{
+  const parts = [], tints = PALETTE.gravelPebbles;
+  for (let i = 0; i < 320; i++) {
+    const a = ld(0, TAU), d = gravelOut(a) * ld(0.08, 1.05) ** 1.3, p = around(a, d), r = ld(0.07, 0.2);
+    if (boulders.some((b) => Math.hypot(b.x - p.x, b.z - p.y) < b.r * 0.85)) continue;
+    parts.push(rockGeometry(0, new THREE.Vector3(r * ld(1, 1.5), r * ld(0.5, 0.8), r), new THREE.Vector3(p.x, -0.02, p.y), tints[(landRand() * tints.length) | 0]));
+  }
+  const geometry = mergeGeometries(parts);
+  parts.forEach((g) => g.dispose());
+  scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshLambertMaterial({ map: rockTex, vertexColors: true }))));
+}
 
 // -------------------------------------------------------------- bank grass
-// tufts all round the rim, thick in the four corners; each is two crossed cards.
-// None grow where a boulder sits, so they come up between the rocks instead.
+// tufts along the outer edge of the gravel, softening the line where it meets the
+// lawn, and in clumps on the gravel at the four corners; each is two crossed cards.
+// None grow where a boulder or bush sits, so they come up between them instead.
 const tuftTex = canvasTexture(16, 16, (ctx) => {
   const blades = PALETTE.tuftBlades;
   for (let i = 0; i < 16; i++) {
@@ -746,12 +929,13 @@ const tuftTex = canvasTexture(16, 16, (ctx) => {
 tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
 {
   const spots = [];
-  for (let i = 0; i < 170; i++) spots.push([rr(0, TAU), 1.03 + 0.28 * rand() ** 2, rr(0.45, 0.85)]);
+  // [angle, how far out, size]
+  for (let i = 0; i < 170; i++) { const a = rr(0, TAU); spots.push([a, gravelOut(a) - 0.4 + 3.2 * rand() ** 2, rr(0.45, 0.85)]); }
   for (const corner of [0.72, 2.45, 3.85, 5.6]) {
-    for (let i = 0; i < 55; i++) spots.push([corner + rr(-0.36, 0.36), 1.03 + 0.5 * rand(), rr(0.7, 1.35)]);
+    for (let i = 0; i < 55; i++) { const a = corner + rr(-0.36, 0.36); spots.push([a, 0.3 + gravelOut(a) * rand(), rr(0.7, 1.35)]); }
   }
-  const clear = spots.filter(([a, k]) => {
-    const at = rim(a, k);
+  const clear = spots.filter(([a, out]) => {
+    const at = around(a, out);
     return at.distanceTo(CAT_AT) > CAT_ROOM && !boulders.some((b) => Math.hypot(b.x - at.x, b.z - at.y) < b.r * 0.85);
   });
   spots.length = 0; spots.push(...clear);
@@ -761,8 +945,8 @@ tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
     psx(new THREE.MeshBasicMaterial({ map: tuftTex, alphaTest: 0.5, side: THREE.DoubleSide }), 0.7, [0, 1.3, 0]),
     spots.length);
   const dummy = new THREE.Object3D(), tint = new THREE.Color();
-  spots.forEach(([a, k, size], i) => {
-    const at = rim(a, k);
+  spots.forEach(([a, out, size], i) => {
+    const at = around(a, out);
     dummy.position.set(at.x, 0, at.y);
     dummy.rotation.y = rr(0, TAU);
     dummy.scale.set(size * 1.15, size, size * 1.15);
@@ -777,7 +961,6 @@ tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
 // ------------------------------------------------------------- cherry tree
 // stands on the far left bank, its boughs out over the water, where the ASCII
 // pond had a blossoming branch reaching in; its petals fall onto the surface
-const TREE_AT = rim(3.85, 1.2);
 const tree = build('cherry-tree', new THREE.Vector3(TREE_AT.x, 0, TREE_AT.y));
 
 // --------------------------------------------------------------------- cat
@@ -790,10 +973,42 @@ if (cat) {
   cat.setVariant('sleep');
 }
 
+// ---------------------------------------------------------- stone lanterns
+// two, set where `LANTERNS` keeps room for them (see landscaping), turned so a
+// moon window looks across the water. The candles are lit from dusk (`lanterns`
+// in TIMES), and each lays a warm pool of light on the ground round its feet.
+const lanternGlowTex = canvasTexture(32, 32, (ctx, w, h) => {
+  const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.45, 'rgba(255,255,255,0.4)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+});
+const lanterns = LANTERNS.map(({ at, turn, scale }, i) => {
+  const model = build('stone-lantern', new THREE.Vector3(at.x, 0, at.y), SEED + 700 + i);
+  if (!model) return null;
+  model.holder.scale.setScalar(scale);
+  model.holder.rotation.y = Math.atan2(-at.x, -at.y) + turn;     // face the middle of the pond, then a little aside
+  const pool = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), psx(new THREE.MeshBasicMaterial({
+    map: lanternGlowTex, color: 0xffb35c, transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, userData: { selfLit: true },
+  })));
+  pool.position.set(at.x, 0.04, at.y);
+  pool.scale.setScalar(9 * scale / 0.5);
+  pool.renderOrder = 8;
+  scene.add(pool);
+  return { model, pool };
+}).filter(Boolean);
+function updateLanterns(dt, time) {
+  lanterns.forEach(({ model, pool }, i) => {
+    model.setLit(hour.lanterns);
+    model.update(dt, time + i * 3.7);
+    pool.material.opacity = 0.32 * hour.lanterns * (0.92 + 0.08 * Math.sin(time * 9.1 + i));
+  });
+}
+
 // ------------------------------------------------------------- time of day
 // Each time of day is a set of values for the lamps, the colour laid over the
 // picture (see graded) and the water; changing the time eases every value from
-// where it is now to the new set. So far: day and sunset.
+// where it is now to the new set. So far: day, sunset and night.
 //
 // The ground is lit and the grass standing on it is not, so the light falling on
 // level ground is kept the same at every hour (the sky lamp makes up what a low sun
@@ -807,7 +1022,7 @@ const TIMES = {
     gradeLight: new THREE.Color(1, 1, 1), gradeShade: new THREE.Color(1, 1, 1),
     waterDeep: new THREE.Color(PALETTE.waterDeep[0]),
     waterSurface: new THREE.Color(PALETTE.waterSurface[0]), waterSurfaceOpacity: PALETTE.waterSurface[1],
-    caustics: new THREE.Color(1, 1, 1), sky: new THREE.Color(1, 1, 1),
+    caustics: new THREE.Color(1, 1, 1), sky: new THREE.Color(1, 1, 1), fireflies: 0, lanterns: 0,
   },
   // the sun low on the left, behind the tree: orange light, violet shade, and the
   // water going the rose of the sky with its web of light turned gold
@@ -816,7 +1031,16 @@ const TIMES = {
     gradeLight: new THREE.Color(1.08, 0.8, 0.6), gradeShade: new THREE.Color(0.55, 0.42, 0.68),
     waterDeep: new THREE.Color(PALETTE.sunsetWaterDeep),
     waterSurface: new THREE.Color(PALETTE.sunsetWaterSurface[0]), waterSurfaceOpacity: PALETTE.sunsetWaterSurface[1],
-    caustics: new THREE.Color(PALETTE.sunsetCaustics).multiplyScalar(1.7), sky: new THREE.Color(PALETTE.sunsetSky),
+    caustics: new THREE.Color(PALETTE.sunsetCaustics).multiplyScalar(1.7), sky: new THREE.Color(PALETTE.sunsetSky), fireflies: 0.25, lanterns: 0.6,
+  },
+  // the moon high on the right: everything sunk to blue, darkest in the shade, the
+  // water nearly black with its web of light thinned to silver
+  night: {
+    ...litAs(new THREE.Vector3(0.5, 0.75, 0.35), 1.3), sunColor: new THREE.Color(PALETTE.nightMoon),
+    gradeLight: new THREE.Color(0.1, 0.17, 0.36), gradeShade: new THREE.Color(0.03, 0.05, 0.15),
+    waterDeep: new THREE.Color(PALETTE.nightWaterDeep),
+    waterSurface: new THREE.Color(PALETTE.nightWaterSurface[0]), waterSurfaceOpacity: PALETTE.nightWaterSurface[1],
+    caustics: new THREE.Color(PALETTE.nightCaustics).multiplyScalar(0.45), sky: new THREE.Color(PALETTE.nightSky), fireflies: 1, lanterns: 1,
   },
 };
 const TIME_NAMES = Object.keys(TIMES), TIME_EASE = 0.7;          // TIME_EASE: the change takes about five seconds
@@ -853,6 +1077,138 @@ function setTimeOfDay(name, atOnce = false) {
 const nextTimeOfDay = () => setTimeOfDay(TIME_NAMES[(TIME_NAMES.indexOf(timeOfDay) + 1) % TIME_NAMES.length]);
 setTimeOfDay(params.get('time') || recall('pond-time'), true);
 timeButton.addEventListener('click', nextTimeOfDay);
+
+// --------------------------------------------------------------- fireflies
+// Out at dusk and through the night (`fireflies` in TIMES is how much of the swarm
+// is out: a few early ones at sunset, all of them at night), behaving as the
+// common eastern firefly does. The males cruise slowly and low over the banks and
+// the water, and every six seconds or so each gives one flash while swooping down
+// and up, drawing a J of light. The females do not fly: they sit in the grass on
+// the banks, and one who sees a male's flash nearby answers with a single flash
+// of her own two seconds later, at which he turns and comes down toward her.
+//
+// The model (models/firefly.js) is shown at twice life size against the koi, and
+// its halo is swollen, or from the pond's camera a flash would be less than a
+// pixel. Each also lays a faint spot of its light on the water or grass beneath.
+const FIREFLY_SCALE = 1.1, FIREFLY_HALO = 18, MALES = 12, FEMALES = 4;
+const FLASH = 0.8, ANSWER_AFTER = 2, HEARING = 7;         // seconds lit, seconds before she answers, how far she sees
+const fireflyRand = mulberry32(SEED + 500), fr = (a, b) => a + (b - a) * fireflyRand();
+const overWater = (x, z) => x * x + z * z < rim(Math.atan2(z / POND_Z, x / POND_X)).lengthSq();
+const spotTex = canvasTexture(32, 32, (ctx, w, h) => {
+  const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.4, 'rgba(255,255,255,0.35)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+});
+const spotGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+const fireflies = [];
+for (let i = 0; i < MALES + FEMALES; i++) {
+  const model = build('firefly', new THREE.Vector3(), SEED + 600 + i);
+  if (!model) break;
+  const female = i >= MALES;
+  model.setVariant(female ? 'perched' : 'flying');
+  model.lamp.removeFromParent();               // its reach is a firefly's own length: nothing here is that close
+  model.setHaloSize(FIREFLY_HALO);
+  model.setGlow(0);
+  model.holder.scale.setScalar(FIREFLY_SCALE);
+  const spot = new THREE.Mesh(spotGeometry, psx(new THREE.MeshBasicMaterial({
+    map: spotTex, color: 0xc8ff58, transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, userData: { selfLit: true },
+  })));
+  spot.renderOrder = 8;                        // over the water's sheets
+  scene.add(spot);
+  // a place on the bank: where a female sits, and where a male comes up out of the grass
+  let home;
+  for (let tries = 0; tries < 30; tries++) {
+    home = rim(fr(0, TAU), fr(1.1, 1.4));
+    if (home.distanceTo(CAT_AT) > CAT_ROOM && !boulders.some((b) => Math.hypot(b.x - home.x, b.z - home.y) < b.r + 0.3)) break;
+  }
+  fireflies.push({
+    model, holder: model.holder, spot, female,
+    x: home.x, z: home.y, heading: fr(0, TAU), speed: 0, cruise: fr(0.5, 0.9),
+    height: fr(0.6, 2.4), low: 0,              // how high he cruises; `low` holds him down while he courts
+    goal: null, patience: 0, phase: fr(0, 20),
+    wakes: (((i * 7) % (MALES + FEMALES)) + 0.5) / (MALES + FEMALES),   // how far into dusk this one comes out
+    up: 0,                                     // 0 hidden in the grass, 1 fully out
+    period: fr(5.5, 7.5), next: fr(1, 7), lit: -1,       // seconds between flashes, until the next, and into this one
+    answer: -1, caller: null,                  // a female's countdown to her reply, and whom it is for
+  });
+}
+const smooth = (t) => THREE.MathUtils.smoothstep(t, 0, 1);
+function updateFireflies(dt, time) {
+  for (const f of fireflies) {
+    const out = hour.fireflies > f.wakes;
+    f.up += ((out ? 1 : 0) - f.up) * Math.min(1, dt * 0.5);
+    f.holder.visible = f.spot.visible = f.up > 0.02;
+    if (!f.holder.visible) { f.lit = -1; continue; }
+
+    let glow = 0, swoop = 0, y = 0.02;
+    if (f.lit >= 0) f.lit += dt;
+    if (f.female) {
+      // she waits; when her countdown runs out she gives one flash, and her caller comes
+      if (f.answer >= 0 && (f.answer -= dt) < 0 && out) {
+        f.lit = 0;
+        if (f.caller) {
+          f.caller.goal = new THREE.Vector2(f.x + (Math.random() - 0.5) * 1.5, f.z + (Math.random() - 0.5) * 1.5);
+          f.caller.patience = f.caller.low = 9;
+        }
+      }
+      if (f.lit >= 0) {
+        const u = f.lit / (FLASH * 0.75);
+        glow = THREE.MathUtils.smoothstep(u, 0, 0.2) * (1 - THREE.MathUtils.smoothstep(u, 0.5, 1));
+        if (u >= 1) f.lit = -1;
+      }
+    } else {
+      // wander: toward a spot somewhere over the pond or its banks, never straight
+      f.patience -= dt; f.low -= dt;
+      if (!f.goal || f.patience <= 0 || Math.hypot(f.goal.x - f.x, f.goal.y - f.z) < 0.8) {
+        f.goal = rim(Math.random() * TAU, 0.2 + 1.25 * Math.random());
+        f.patience = 8 + Math.random() * 10;
+        f.cruise = 0.5 + Math.random() * 0.4;
+      }
+      const want = Math.atan2(f.goal.y - f.z, f.goal.x - f.x);
+      const turn = Math.atan2(Math.sin(want - f.heading), Math.cos(want - f.heading));
+      f.heading += THREE.MathUtils.clamp(turn, -1.1 * dt, 1.1 * dt) + 0.5 * Math.sin(time * 0.7 + f.phase) * dt;
+      f.speed += (f.cruise * f.up - f.speed) * Math.min(1, dt * 1.5);
+      f.x += Math.cos(f.heading) * f.speed * dt;
+      f.z += Math.sin(f.heading) * f.speed * dt;
+      f.holder.rotation.y = Math.PI / 2 - f.heading;         // the model faces +z
+
+      // the flash: lit through a dip and a climb, then sinking back to his cruising height
+      if ((f.next -= dt) <= 0 && out && f.up > 0.8) { f.lit = 0; f.next = f.period + Math.random() - 0.5; }
+      if (f.lit >= 0) {
+        const u = f.lit / FLASH;
+        glow = THREE.MathUtils.smoothstep(u, 0.05, 0.2) * (1 - THREE.MathUtils.smoothstep(u, 0.75, 1));
+        swoop = u < 0.25 ? -0.18 * Math.sin(u / 0.25 * Math.PI / 2)
+          : u < 1 ? -0.18 + 0.68 * smooth((u - 0.25) / 0.75)
+          : 0.5 * (1 - smooth((f.lit - FLASH) / 1.8));
+        if (u >= 1 && !f.told) {
+          // any female near enough to have seen it may answer
+          f.told = true;
+          for (const she of fireflies) {
+            if (!she.female || she.answer >= 0 || she.lit >= 0 || hour.fireflies <= she.wakes) continue;
+            if (Math.hypot(she.x - f.x, she.z - f.z) < HEARING && Math.random() < 0.6) {
+              she.answer = ANSWER_AFTER + (Math.random() - 0.5) * 0.3;
+              she.caller = f;
+            }
+          }
+        }
+        if (f.lit > FLASH + 1.8) { f.lit = -1; f.told = false; }
+      }
+      const height = f.low > 0 ? 0.5 : f.height;
+      f.flown = (f.flown ?? height) + (height - (f.flown ?? height)) * Math.min(1, dt * 0.4);
+      y = 0.15 + (f.flown + 0.15 * Math.sin(time * 0.8 + f.phase) + swoop) * f.up;
+    }
+    f.holder.position.set(f.x, y, f.z);
+    f.model.setGlow(glow * f.up);
+    f.model.update(dt, time + f.phase);
+
+    // his light on whatever is below, fainter the higher he is
+    const reach = 1 / (1 + (y / 1.2) ** 2);
+    f.spot.position.set(f.x, overWater(f.x, f.z) ? -0.07 : 0.03, f.z);
+    f.spot.scale.setScalar(1.2 + y * 0.9);
+    f.spot.material.opacity = 0.5 * glow * f.up * reach;
+  }
+}
 
 // ------------------------------------------------------ camera + controls
 // The camera always looks from the same angle: from the near bank, down across
@@ -1101,6 +1457,8 @@ renderer.setAnimationLoop(() => {
   tree?.update?.(dt, time);
   cat?.update(dt, time);
   updateTimeOfDay(dt);
+  updateFireflies(dt, time);
+  updateLanterns(dt, time);
   caustics[0].offset.set(time * 0.014, time * 0.008);
   caustics[1].offset.set(-time * 0.009, time * 0.012);
   caustics[2].offset.set(time * 0.006, -time * 0.01);

@@ -66,7 +66,7 @@ import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- settings
-const MODEL_FILES = ['cherry-tree', 'cat', 'koi'];
+const MODEL_FILES = ['cherry-tree', 'cat', 'koi', 'firefly', 'stone-lantern'];
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get('seed')) || 3;
 // The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
@@ -635,7 +635,7 @@ function showModel(name) {
   // fit the camera, shadow and room to the model
   const box = current.bounds || new THREE.Box3().setFromObject(current.object);
   const size = box.getSize(new THREE.Vector3()), mid = box.getCenter(new THREE.Vector3());
-  const top = Math.max(box.max.y, 0.5), radius = Math.max(size.x, size.z, 0.5) / 2;
+  const top = Math.max(box.max.y, 0.01), radius = Math.max(size.x, size.z, 0.01) / 2;
   const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const fit = Math.max((top / 2) / tanV, radius / (tanV * camera.aspect));
   frame.target.set(mid.x, top * 0.5, mid.z);
@@ -647,12 +647,16 @@ function showModel(name) {
   frame.dist = (fit * 1.05 + radius * 0.4) * view.back;
   frame.rise = top * view.rise;
   frame.turn = view.turn;
-  controls.minDistance = Math.max(1, radius * 0.6);
+  controls.minDistance = Math.max(Math.min(1, radius), radius * 0.6);
+  // a model far smaller than the rest (the firefly) is framed from so close that the
+  // usual near plane would cut into it
+  camera.near = Math.min(0.5, controls.minDistance * 0.2);
+  camera.updateProjectionMatrix();
   controls.maxDistance = Math.max(24, frame.dist * 1.6);
 
   // round, unless the model gives the half-widths of its own footprint
   shadow.scale.set(current.shadow?.x ?? radius * 0.95, current.shadow?.z ?? radius * 0.95, 1);
-  shadow.position.set(mid.x, 0.03, mid.z);
+  shadow.position.set(mid.x, Math.min(0.03, top * 0.02), mid.z);     // just clear of the floor, at the model's own scale
 
   const width = controls.maxDistance * 2 + 6, height = Math.max(16, top * 2);  // the camera stays inside
   room.scale.set(width, height, width);
