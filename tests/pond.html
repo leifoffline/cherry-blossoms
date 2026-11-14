@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Koi Pond · Low Poly</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
+    font: bold 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    letter-spacing: 0.12em; color: #fff; text-shadow: 1px 1px 0 #1a3a8a;
+    pointer-events: none; transition: opacity 2s;
+  }
+  #hint.error { background: #b3261e; text-shadow: none; padding: 6px 0; }
+  .bar { position: fixed; top: 14px; right: 14px; display: flex; gap: 8px; }
+  .bar button {
+    padding: 6px 10px; margin: 0;
+    font: bold 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 0.1em;
+    color: #fff; background: rgba(10, 30, 90, 0.45); border: 1px solid #fff; border-radius: 3px;
+    opacity: 0.7; cursor: pointer;
+  }
+  .bar button:hover, .bar button:focus-visible { opacity: 1; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div class="bar"><button id="crt" type="button" aria-pressed="true">CRT: on</button></div>
+<div id="hint">scroll to zoom in · drag to look around<br>C CRT · R default view</div>
+<script type="module">
+// Koi pond: the ASCII pond from the ascii_pond project, remade in the low-poly
+// renderer. So far: the water and its pebbled floor, five koi (models/koi.js)
+// wandering under the surface, boulders and pebbles round the rim, and the foliage:
+// lily pads, two stands of reeds and cattails, grass round the banks, and the cherry
+// tree (models/cherry-tree.js) leaning in where the blossom branch was. The camera
+// keeps one angle: it opens on a default view of the whole pond, and zooming in
+// lets you slide the view about. Still to come, one at a time: ducks and
+// ducklings, floating petals, dragonflies, fireflies, the heron and swan, feeding,
+// ripples, time of day, rain.
+//
+// URL options: ?crt=off, ?seed=12.
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---------------------------------------------------------------- settings
+const MODEL_FILES = ['koi', 'cherry-tree'];
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get('seed')) || 3;
+// The PS2's standard picture: a 512x448 frame stretched over a 4:3 television,
+// so its pixels are a sixth wider than they are tall. The window is not forced
+// to that size or shape; it is filled with pixels of that size and shape instead
+// (see resize), so a 4:3 window gets exactly 512x448 and a wider one more columns.
+const RENDER_WIDTH = 512, RENDER_HEIGHT = 448;
+const SUBPIXEL = 16;            // the PS2 placed vertices to a sixteenth of a pixel
+const SUN_DIR = new THREE.Vector3(-0.45, 0.42, -0.8).normalize();
+const WIND_DIR = new THREE.Vector3(1, 0, 0.35).normalize();
+const TAU = Math.PI * 2;
+
+// ----------------------------------------------------------------- palette
+// The project's palette, halfway between a bright arcade set and painted
+// Japanese-summer backgrounds: a deep cobalt
+// sky with shaded white clouds, greens that run from a bluish forest shadow to a
+// yellow-green highlight, warm earth and wood, cool grey stone. Each page and
+// model file keeps its own copy of the colours it uses; keep them in step.
+// Here that adds dark blue-green water with the bed stones showing through.
+// (The koi and the cherry tree bring their own colours from their model files.)
+const PALETTE = {
+  skyLight: 0xffffff, groundLight: 0xd8c4bc, sunLight: 0xfff4dc,
+  skyTop: [16, 80, 207], skyLow: [94, 167, 244], cloudShade: [168, 192, 224],
+  grass: ['#2d7c2f', '#3b9634', '#4fac39', '#67bf40', '#86d14b'],            // dark to light
+  grassBlades: ['#a2de55', '#bde96a', '#82cd48', '#24692a', '#1e5b26'],      // three highlights, two shadows
+  tuftBlades: ['#a0dd53', '#bae867', '#84ce48', '#5bac3b', '#cfef82'],
+  tuftTints: [0xffffff, 0xe4f5d1, 0xcee9be, 0xf5fcda],
+  bedFloor: ['#569798', '#589696', '#54989a', '#5c9594'],
+  bedStones: ['#7cb4b2', '#90c1be', '#6da7a8', '#a2ccc8', '#78a9aa'], bedShade: '#3c787c',
+  bank: ['#d8bc7e', '#cbad6f', '#e2ca8f', '#bea165'], bankMoss: '#84a962',
+  waterDeep: [0x0e6c8f, 0.5], waterSurface: [0x24afc0, 0.35],                 // colour, opacity
+  causticBed: [0xd4f8f8, 0.3], caustics: [[0xe6faff, 0.21], [0xc6f6f6, 0.13]],
+  padRim: '#5a9a5e', padVein: '#b6db9a', padFleck: '#75b36f', pad: '#83c076',
+  padTints: [0xffffff, 0xe6f2da, 0xd4eac9],
+  reedLow: '#4b8355', reedHigh: '#b8da8f', cattailStalk: '#76a362', cattailHead: '#8a5c3c', cattailSpike: '#c8b684',
+  rock: ['#c4c2bc', '#d2d0c9', '#b2b0ac', '#e1ded6'], rockGritDark: '#807e79', rockGritLight: '#e4dfd2', rockCrack: '#72716e',
+  rockTints: ['#ffffff', '#f8f2e9', '#f0e8d9', '#e9ecf1', '#f6ecdc', '#e2ddd4'], pebbleTints: ['#ffffff', '#dee0e5'],
+};
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = reducedMotion ? 0.35 : 1;
+const remember = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+const recall = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+
+// ------------------------------------------------------------- seeded RNG
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(SEED);                 // for the pond itself; each model gets its own stream
+const rr = (a, b) => a + (b - a) * rand();
+const pick = (list) => list[(rand() * list.length) | 0];
+
+// ------------------------------------------------------------ scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 1200);
+
+scene.add(new THREE.HemisphereLight(PALETTE.skyLight, PALETTE.groundLight, 2.6));
+const sun = new THREE.DirectionalLight(PALETTE.sunLight, 2.0);
+sun.position.copy(SUN_DIR).multiplyScalar(50);
+scene.add(sun);
+
+// -------------------------------------------------------- painted textures
+// Small textures painted in code. They are filtered smoothly, as the PS2 did:
+// up close a texel blurs into its neighbours instead of showing as a square
+// (`pixelated: true` gives the hard PS1 squares back).
+// `cutout: true` is for textures with see-through parts that are cut out by
+// alphaTest. Smoothing would otherwise blend the black that lies under the
+// transparent pixels into the edges and outline every shape darkly, so the
+// colours at the edges are first spread outward under the transparent part; a
+// canvas cannot hold a colour in a fully transparent pixel, so these become data
+// textures (and cannot be repainted later, as the koi's skin is).
+function canvasTexture(w, h, paint, { pixelated = false, mipmaps = !pixelated, cutout = false } = {}) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: cutout });
+  paint(ctx, w, h);
+  const t = cutout ? cutoutTexture(ctx, w, h) : new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.magFilter = pixelated ? THREE.NearestFilter : THREE.LinearFilter;
+  t.generateMipmaps = mipmaps && !cutout;      // smaller copies of a cut-out thin its shapes away at a distance
+  t.minFilter = t.generateMipmaps ? THREE.LinearMipmapLinearFilter : (pixelated ? THREE.NearestFilter : THREE.LinearFilter);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+function cutoutTexture(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data, filled = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) filled[i] = d[i * 4 + 3] > 0 ? 1 : 0;
+  for (let pass = 0; pass < 4; pass++) {         // each pass carries the colours one pixel further out
+    const next = filled.slice();
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (filled[i]) continue;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy, j = Y * w + X;
+        if (X < 0 || Y < 0 || X >= w || Y >= h || !filled[j]) continue;
+        r += d[j * 4]; g += d[j * 4 + 1]; b += d[j * 4 + 2]; n++;
+      }
+      if (n) { d[i * 4] = r / n; d[i * 4 + 1] = g / n; d[i * 4 + 2] = b / n; next[i] = 1; }
+    }
+    filled.set(next);
+  }
+  const flipped = new Uint8Array(w * h * 4);     // a data texture's first row is its bottom one
+  for (let y = 0; y < h; y++) flipped.set(d.subarray(y * w * 4, (y + 1) * w * 4), (h - 1 - y) * w * 4);
+  const t = new THREE.DataTexture(flipped, w, h, THREE.RGBAFormat);
+  t.needsUpdate = true;
+  return t;
+}
+
+// grass: soft light and dark patches with short blade strokes on top; wraps seamlessly
+const GRASS_SIZE = 64;
+const grassTex = canvasTexture(GRASS_SIZE, GRASS_SIZE, (ctx, w, h) => {
+  const G = 8, grid = Array.from({ length: G * G }, () => rand());
+  const patch = (x, y) => {                    // smooth noise that repeats every w pixels
+    const fx = (x / w) * G, fy = (y / h) * G, x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const u = fx - x0, v = fy - y0, at = (i, j) => grid[((j + G) % G) * G + ((i + G) % G)];
+    const L = THREE.MathUtils.lerp;
+    return L(L(at(x0, y0), at(x0 + 1, y0), u), L(at(x0, y0 + 1), at(x0 + 1, y0 + 1), u), v);
+  };
+  const greens = PALETTE.grass;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const n = patch(x, y) + rr(-0.16, 0.16);
+    ctx.fillStyle = greens[THREE.MathUtils.clamp(Math.floor(n * greens.length), 0, greens.length - 1)];
+    ctx.fillRect(x, y, 1, 1);
+  }
+  const blades = PALETTE.grassBlades;
+  for (let i = 0; i < 520; i++) {
+    let x = (rand() * w) | 0, y = (rand() * h) | 0;
+    const len = 2 + ((rand() * 4) | 0), lean = rand() < 0.5 ? -1 : 1;
+    ctx.fillStyle = pick(blades);
+    for (let k = 0; k < len; k++) {
+      ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
+      y -= 1; if (k % 2 === 1) x += lean;
+    }
+  }
+});
+
+// sky: blue gradient with wispy clouds, painted once from layered noise; 256 wide, the
+// largest texture a PS2 scene would commonly spend on a sky, and smooth rather than pixelled
+function hash3(x, y, z) {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2147483647) ^ (SEED * 9781);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise3(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const s = (t) => t * t * (3 - 2 * t);
+  const u = s(x - xi), v = s(y - yi), w = s(z - zi);
+  const L = THREE.MathUtils.lerp;
+  const at = (a, b, c) => hash3(xi + a, yi + b, zi + c);
+  return L(
+    L(L(at(0, 0, 0), at(1, 0, 0), u), L(at(0, 1, 0), at(1, 1, 0), u), v),
+    L(L(at(0, 0, 1), at(1, 0, 1), u), L(at(0, 1, 1), at(1, 1, 1), u), v), w);
+}
+const skyTex = canvasTexture(256, 128, (ctx, w, h) => {
+  const img = ctx.createImageData(w, h);
+  const density = (a, y) => {                          // how thick the cloud is at angle `a` round the sky, row `y`
+    let n = 0, amp = 0.5, f = 1;
+    for (let o = 0; o < 5; o++) {
+      n += amp * noise3(Math.cos(a) * 2.2 * f, Math.sin(a) * 2.2 * f, (y / h) * 9 * f + o * 7.3);
+      amp *= 0.5; f *= 2;
+    }
+    return n;
+  };
+  const top = PALETTE.skyTop, low = PALETTE.skyLow;
+  for (let y = 0; y < h; y++) {
+    const up = Math.max(0, 1 - y / (h / 2));           // 1 at the zenith, 0 at the horizon and below
+    for (let x = 0; x < w; x++) {
+      const a = (x / w) * Math.PI * 2;                 // sampled around a circle so the seam matches
+      const n = density(a, y);
+      const cloud = THREE.MathUtils.smoothstep(n, 0.4, 0.62) * THREE.MathUtils.smoothstep(up, 0.02, 0.3);
+      // clouds are white on top and blue-grey underneath: a point is in shade
+      // by how much cloud there is a little way above it
+      const shade = 0.75 * THREE.MathUtils.smoothstep(density(a, y - h * 0.035), 0.46, 0.7);
+      const g = Math.pow(up, 0.7);
+      const i = (y * w + x) * 4;
+      for (let k = 0; k < 3; k++) img.data[i + k] = THREE.MathUtils.lerp(THREE.MathUtils.lerp(low[k], top[k], g), THREE.MathUtils.lerp(255, PALETTE.cloudShade[k], shade), cloud);
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+});
+skyTex.wrapT = THREE.ClampToEdgeWrapping;
+
+// ------------------------------------------------ PS2-style vertex shader
+// Every material gets vertex snapping, to the PS2's sixteenth of a pixel (a
+// whole pixel, SUBPIXEL = 1, gives the heavy wobble of the PS1). Plants also get
+// wind. How far a point bends depends on its height and, for the tree, on how far
+// out it is from the trunk; `flex` is [height where bending starts, height where it
+// is full, extra bend per unit out from the root]. The root is wherever
+// `windRoot` was pointing when the material was made.
+const shared = { uTime: { value: 0 }, uSnap: { value: new THREE.Vector2(160, 120) } };
+const windRoot = new THREE.Vector3();
+const TREE_FLEX = [2.2, 9, 0.03];
+const PSX_GLSL = /* glsl */`
+  uniform float uTime;
+  uniform float uWind;
+  uniform vec2 uSnap;
+  uniform vec3 uWindRoot;
+  uniform vec3 uFlex;
+  vec3 windOffset(vec3 p) {
+    float flex = smoothstep(uFlex.x, uFlex.y, p.y) * 0.75 + uFlex.z * length(p.xz - uWindRoot.xz);
+    float gust = 0.3
+      + 0.6 * sin(uTime * 0.9 + p.x * 0.35 + p.z * 0.25)
+      + 0.25 * sin(uTime * 2.3 + p.x * 1.3 + p.y * 0.9);
+    vec3 dir = normalize(vec3(1.0, 0.0, 0.35));
+    vec3 o = dir * flex * gust * 0.3;
+    o.y += sin(uTime * 3.1 + p.x * 2.0 + p.z * 2.0) * 0.03 * flex;
+    return o * uWind;
+  }
+`;
+const PSX_PROJECT_GLSL = /* glsl */`
+  vec4 wPos = vec4(transformed, 1.0);
+  #ifdef USE_INSTANCING
+    wPos = instanceMatrix * wPos;
+  #endif
+  wPos = modelMatrix * wPos;
+  wPos.xyz += windOffset(wPos.xyz);
+  vec4 mvPosition = viewMatrix * wPos;
+  gl_Position = projectionMatrix * mvPosition;
+  gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;
+`;
+function psx(material, windAmount = 0, flex = TREE_FLEX) {
+  const uniforms = {
+    uWind: { value: windAmount * MOTION },
+    uWindRoot: { value: windRoot.clone() },
+    uFlex: { value: new THREE.Vector3(...flex) },
+  };
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = shared.uTime;
+    shader.uniforms.uSnap = shared.uSnap;
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + PSX_GLSL)
+      .replace('#include <project_vertex>', PSX_PROJECT_GLSL);
+  };
+  material.customProgramCacheKey = () => 'psx';
+  return material;
+}
+
+// --------------------------------------------------------------------- sky
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(900, 24, 12),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, depthWrite: false, fog: false })
+);
+sky.renderOrder = -1;
+scene.add(sky);
+
+// ------------------------------------------------------------- pond shape
+// The pond is a lopsided oval. `rim(a, k)` is the point at angle `a` round it, `k`
+// of the way out from the middle (1 = the water's edge), as (x, z).
+const POND_X = 13, POND_Z = 8.6, DEPTH = 2.3, SEG = 72;
+function rim(a, k = 1) {
+  const wobble = 1 + 0.07 * Math.sin(3 * a + 0.6) + 0.05 * Math.sin(5 * a + 2.1);
+  return new THREE.Vector2(Math.cos(a) * POND_X * wobble * k, Math.sin(a) * POND_Z * wobble * k);
+}
+const ringOf = (k, y) => Array.from({ length: SEG }, (_, i) => {
+  const p = rim((i / SEG) * TAU, k);
+  return new THREE.Vector3(p.x, y, p.y);
+});
+function geometryOf(pos, uv, index) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(pos.map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+  g.setIndex(index);
+  return g;
+}
+// a flat sheet filling a ring of points, textured by position (`tile` world units a repeat)
+function sheet(ring, tile) {
+  const pos = [0, ring[0].y, 0], uv = [0, 0], index = [];
+  ring.forEach((p, i) => {
+    pos.push(p.x, p.y, p.z); uv.push(p.x / tile, p.z / tile);
+    index.push(0, 1 + ((i + 1) % ring.length), 1 + i);
+  });
+  return geometryOf(pos, uv, index);
+}
+// a strip joining two rings; textured by position, or wrapped `wrap` times round if given
+function band(inner, outer, tile, wrap) {
+  const pos = [], uv = [], index = [], n = inner.length;
+  for (let i = 0; i <= n; i++) {
+    const a = inner[i % n], b = outer[i % n];
+    pos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    if (wrap) uv.push((i / n) * wrap, 1, (i / n) * wrap, 0);
+    else uv.push(a.x / tile, a.z / tile, b.x / tile, b.z / tile);
+    if (i < n) index.push(i * 2, i * 2 + 2, i * 2 + 1, i * 2 + 2, i * 2 + 3, i * 2 + 1);
+  }
+  return geometryOf(pos, uv, index);
+}
+
+// ---------------------------------------------------------- ground and bed
+// grass everywhere but the pond
+const TEXEL = 0.1;                             // world size of one grass pixel
+{
+  const far = Array.from({ length: SEG }, (_, i) => {
+    const a = (i / SEG) * TAU;
+    return new THREE.Vector3(Math.cos(a) * 600, 0, Math.sin(a) * 600);
+  });
+  scene.add(new THREE.Mesh(band(ringOf(1, 0), far, GRASS_SIZE * TEXEL), psx(new THREE.MeshLambertMaterial({ map: grassTex }))));
+}
+
+// the bed: rounded stones on a darker floor, already tinted as if seen through
+// water; the water sheets above deepen it toward the middle
+const pebbleTex = canvasTexture(64, 64, (ctx, w, h) => {
+  const floor = PALETTE.bedFloor;
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) { ctx.fillStyle = pick(floor); ctx.fillRect(x, y, 2, 2); }
+  const stones = PALETTE.bedStones;
+  for (let i = 0; i < 30; i++) {
+    const cx = rr(0, w), cy = rr(0, h), rx = rr(1.6, 4.6), ry = rx * rr(0.6, 1), light = pick(stones), dark = PALETTE.bedShade;
+    for (let y = -6; y <= 6; y++) for (let x = -6; x <= 6; x++) {
+      const d = (x / rx) ** 2 + (y / ry) ** 2;
+      if (d > 1) continue;
+      ctx.fillStyle = d > 0.6 && x + y > 0 ? dark : light;       // a shaded lower-right edge
+      ctx.fillRect((((cx + x) | 0) + w) % w, (((cy + y) | 0) + h) % h, 1, 1);
+    }
+  }
+});
+const bankTex = canvasTexture(16, 16, (ctx) => {
+  const earth = PALETTE.bank;                    // paler than the bed, so the shallows at the edge show light
+  for (let y = 0; y < 16; y += 2) for (let x = 0; x < 16; x += 2) { ctx.fillStyle = pick(earth); ctx.fillRect(x, y, 2, 2); }
+  ctx.fillStyle = PALETTE.bankMoss;             // moss along the top
+  for (let x = 0; x < 16; x++) ctx.fillRect(x, 0, 1, 1 + ((rand() * 3) | 0));
+});
+scene.add(new THREE.Mesh(sheet(ringOf(0.9, -DEPTH), 6), psx(new THREE.MeshBasicMaterial({ map: pebbleTex }))));
+scene.add(new THREE.Mesh(band(ringOf(0.9, -DEPTH), ringOf(1, 0), 0, 26), psx(new THREE.MeshBasicMaterial({ map: bankTex, side: THREE.DoubleSide }))));
+
+// ------------------------------------------------------------------- water
+// Water as PS2 games drew it: no reflection or refraction, just see-through
+// colour with a soft web of light (caustics) drifting over it. Two sheets of
+// colour, one at the surface and one halfway down, make things bluer the deeper
+// they are and leave the shallows at the bank pale. The same web texture is laid three
+// times and slid in different directions: twice on the surface, at two sizes, so
+// the lines cross and seem to ripple, and once on the bed, where it shows through
+// the water as light playing on the floor. Filtered, scrolling textures were how
+// that hardware made water look liquid.
+const causticTex = canvasTexture(64, 64, (ctx, w, h) => {
+  // bright lines along the borders between scattered cells; the cells repeat
+  // across the edges of the texture so that it tiles
+  const N = 6, points = Array.from({ length: N * N }, () => [rand(), rand()]);
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const u = x / w, v = y / h;
+    const gx = u * N + 0.22 * Math.sin(v * TAU * 2 + 1.3), gy = v * N + 0.22 * Math.sin(u * TAU * 3 + 0.4);   // bend the lines a little
+    const cx = Math.floor(gx), cy = Math.floor(gy);
+    let d1 = 9, d2 = 9;                         // distances to the nearest and second-nearest cell centre
+    for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+      const p = points[((cy + j + N) % N) * N + ((cx + i + N) % N)];
+      const d = Math.hypot(cx + i + p[0] - gx, cy + j + p[1] - gy);
+      if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d;
+    }
+    const line = Math.max(0, 1 - (d2 - d1) / 0.3) ** 2;          // 1 on a border, fading quickly either side
+    const glow = 0.12 * Math.max(0, 1 - d1);                     // and a faint lightness inside each cell
+    const k = (y * w + x) * 4, c = Math.min(1, line + glow) * 255;
+    img.data[k] = img.data[k + 1] = img.data[k + 2] = c; img.data[k + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+});
+const caustics = [causticTex, causticTex.clone(), causticTex.clone()];
+caustics.forEach((t) => { t.needsUpdate = true; });
+const light = (map, color, opacity) => new THREE.MeshBasicMaterial({ map, color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false });
+const tint = (color, opacity) => new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false });
+const waterLayers = [
+  { y: -DEPTH + 0.05, k: 0.9, tile: 7, material: light(caustics[2], ...PALETTE.causticBed) },                      // light on the bed
+  { y: -1.45, k: 0.95, material: tint(...PALETTE.waterDeep) },
+  { y: -0.1, material: tint(...PALETTE.waterSurface) },
+  { y: -0.09, tile: 9, material: light(caustics[0], ...PALETTE.caustics[0]) },
+  { y: -0.08, tile: 15, material: light(caustics[1], ...PALETTE.caustics[1]) },
+];
+waterLayers.forEach(({ y, k = 0.998, tile = 1, material }, i) => {
+  const mesh = new THREE.Mesh(sheet(ringOf(k, y), tile), psx(material));
+  mesh.renderOrder = 1 + i;
+  scene.add(mesh);
+});
+
+// ------------------------------------------------------------------ models
+// the same model files the viewer shows (see viewer.html); here they are built
+// several times over and placed around the pond
+const registry = new Map();
+window.THREE = THREE;
+window.registerModel = (def) => registry.set(def.name, def);
+
+const hint = document.getElementById('hint');
+function fail(message, error) {
+  if (error) console.error(error);
+  hint.textContent = message;
+  hint.className = 'error';
+  hint.style.opacity = 1;
+}
+const loadScript = (src) => new Promise((resolve) => {
+  const s = document.createElement('script');
+  s.src = src;
+  s.onload = resolve;
+  s.onerror = () => { fail(`could not load ${src}`); resolve(); };
+  document.head.appendChild(s);
+});
+for (const file of MODEL_FILES) await loadScript(`models/${file}.js`);
+
+// builds a model standing at `at`; its plants sway about that spot
+function build(name, at, seed = SEED) {
+  windRoot.copy(at);
+  try {
+    const built = registry.get(name).build({
+      THREE, psx, canvasTexture, mergeGeometries,
+      rand: mulberry32(seed), seed, sunDir: SUN_DIR, windDir: WIND_DIR,
+    });
+    const model = built.isObject3D ? { object: built } : built;
+    const holder = new THREE.Group();
+    holder.position.copy(at);
+    holder.add(model.object);
+    scene.add(holder);
+    return { ...model, holder };
+  } catch (error) {
+    fail(`${name} failed to build: ${error?.message ?? 'not loaded'}`, error);
+    return null;
+  } finally {
+    windRoot.set(0, 0, 0);
+  }
+}
+
+// --------------------------------------------------------------------- koi
+// Five koi, as in the ASCII pond: each swims toward a spot picked somewhere in the
+// pond, turning gradually, then picks another. They keep to their own depths.
+const KOI_SCALE = 0.55, KOI_HOVER = 1.7;       // the model floats this far above its own origin
+const koi = [['kohaku', 1.15], ['ogon', 0.95], ['sanke', 0.85], ['shusui', 1.0], ['showa', 0.72]].map(([variety, size], i) => {
+  const model = build('koi', new THREE.Vector3(), SEED + i);
+  if (!model) return null;
+  model.setVariant(variety);
+  const scale = KOI_SCALE * size, start = rim(rr(0, TAU), rr(0.15, 0.7));
+  model.holder.scale.setScalar(scale);
+  return {
+    model, holder: model.holder,
+    x: start.x, z: start.y, y: -0.55 - 0.16 * i - KOI_HOVER * scale,
+    heading: rr(0, TAU), speed: 0, cruise: rr(0.9, 1.4), goal: null, patience: 0, clock: rr(0, 20),
+  };
+}).filter(Boolean);
+
+function updateKoi(dt) {
+  for (const k of koi) {
+    k.patience -= dt;
+    if (!k.goal || k.patience <= 0 || Math.hypot(k.goal.x - k.x, k.goal.y - k.z) < 2) {
+      k.goal = rim(Math.random() * TAU, 0.1 + 0.62 * Math.random());
+      k.patience = 12 + Math.random() * 14;
+      k.cruise = 0.8 + Math.random() * 0.7;
+    }
+    const want = Math.atan2(k.goal.y - k.z, k.goal.x - k.x);
+    const turn = Math.atan2(Math.sin(want - k.heading), Math.cos(want - k.heading));
+    k.heading += THREE.MathUtils.clamp(turn, -0.7 * dt, 0.7 * dt);
+    k.speed += (k.cruise * (1 - 0.45 * Math.min(1, Math.abs(turn))) - k.speed) * Math.min(1, dt * 1.5);   // slower through a turn
+    k.x += Math.cos(k.heading) * k.speed * dt;
+    k.z += Math.sin(k.heading) * k.speed * dt;
+    k.holder.position.set(k.x, k.y, k.z);
+    k.holder.rotation.y = Math.PI - k.heading;   // the model faces -x
+    const swim = dt * (0.5 + 0.5 * k.speed);     // the tail beats with the speed
+    k.clock += swim;
+    k.model.update(swim, k.clock);
+  }
+}
+
+// --------------------------------------------------------------- lily pads
+// round leaves with a notch, lying on the water; no flowers
+const padTex = canvasTexture(16, 16, (ctx) => {
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    const dx = x - 7.5, dy = y - 7.5, r = Math.hypot(dx, dy) / 8, spoke = ((Math.atan2(dy, dx) / TAU + 1) * 9) % 1;
+    ctx.fillStyle = r > 0.86 ? PALETTE.padRim : spoke < 0.16 && r > 0.12 ? PALETTE.padVein : rand() < 0.18 ? PALETTE.padFleck : PALETTE.pad;
+    ctx.fillRect(x, y, 1, 1);
+  }
+});
+const padGeometry = new THREE.CircleGeometry(1, 11, 0.25, TAU - 0.5).rotateX(-Math.PI / 2);
+const padMaterials = PALETTE.padTints.map((color) => psx(new THREE.MeshBasicMaterial({ map: padTex, color })));
+const pads = [];
+for (let tries = 0; pads.length < 22 && tries < 2000; tries++) {
+  const p = rim(rr(0, TAU), 0.3 + 0.6 * rand() ** 0.6), r = rr(0.6, 1.05);
+  if (pads.some((o) => Math.hypot(o.x - p.x, o.z - p.y) < o.r + r + 0.25)) continue;
+  const mesh = new THREE.Mesh(padGeometry, pick(padMaterials));
+  mesh.scale.setScalar(r);
+  mesh.rotation.y = rr(0, TAU);
+  scene.add(mesh);
+  pads.push({ mesh, x: p.x, z: p.y, r, phase: rr(0, TAU), turn: mesh.rotation.y });
+}
+function updatePads(time) {                    // each drifts a little about its place and rocks on the water
+  for (const p of pads) {
+    p.mesh.position.set(p.x + 0.12 * Math.sin(time * 0.23 + p.phase), 0.015 + 0.012 * Math.sin(time * 0.9 + p.phase), p.z + 0.12 * Math.cos(time * 0.19 + p.phase * 1.7));
+    p.mesh.rotation.y = p.turn + 0.12 * Math.sin(time * 0.15 + p.phase);
+  }
+}
+
+// ------------------------------------------------------- reeds and cattails
+// two short stands at the water's edge, in opposite corners
+const colourBy = (geometry, colourAt) => {     // paints each point by its height
+  const p = geometry.attributes.position, c = new Float32Array(p.count * 3), col = new THREE.Color();
+  for (let i = 0; i < p.count; i++) { col.set(colourAt(p.getY(i))); c.set([col.r, col.g, col.b], i * 3); }
+  geometry.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  return geometry;
+};
+const SHORE = -0.4;                            // plants root a little under the surface
+function reedStand(angle, count) {
+  const parts = [], low = new THREE.Color(PALETTE.reedLow), high = new THREE.Color(PALETTE.reedHigh);
+  for (let i = 0; i < count; i++) {
+    const at = rim(angle + rr(-0.22, 0.22), rr(0.82, 1.0)), h = rr(1.3, 2.6);
+    const lean = rr(-0.3, 0.3), bow = rr(-0.25, 0.25);
+    const blade = new THREE.PlaneGeometry(0.3, h, 1, 4).translate(0, h / 2, 0), p = blade.attributes.position;
+    for (let k = 0; k < p.count; k++) {        // taper to a point, and bend over
+      const f = p.getY(k) / h;
+      p.setXYZ(k, p.getX(k) * (1 - 0.9 * f) + lean * f * f * h * 0.4, p.getY(k), bow * f * f * h * 0.4);
+    }
+    colourBy(blade, (y) => low.clone().lerp(high, y / h));
+    parts.push(blade.rotateY(rr(0, TAU)).translate(at.x, SHORE, at.y));
+    if (i % 3 === 0 && h > 1.7) {              // a cattail: a stalk with a brown head and a spike
+      const stalk = colourBy(new THREE.CylinderGeometry(0.02, 0.03, h + 0.3, 4).translate(0, (h + 0.3) / 2, 0), () => PALETTE.cattailStalk);
+      const top = colourBy(new THREE.CylinderGeometry(0.085, 0.085, 0.5, 6).translate(0, h + 0.2, 0), () => PALETTE.cattailHead);
+      const spike = colourBy(new THREE.CylinderGeometry(0.008, 0.02, 0.3, 4).translate(0, h + 0.6, 0), () => PALETTE.cattailSpike);
+      const x = at.x + rr(-0.25, 0.25), z = at.y + rr(-0.25, 0.25);
+      for (const g of [stalk, top, spike]) parts.push(g.translate(x, SHORE, z));
+    }
+  }
+  const geometry = mergeGeometries(parts);
+  parts.forEach((g) => g.dispose());
+  scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }), 1, [0.1, 2.8, 0])));
+}
+reedStand(2.5, 22);                            // near left
+reedStand(-0.62, 18);                          // far right
+
+// ------------------------------------------------------------------- rocks
+// Pale garden boulders ringing the water, as round a rockery pond: one row
+// straddling the rim, a heap two and three rocks deep on the far bank, and
+// drifts of small pebbles in between. They draw from their own random stream so
+// that adding or moving a rock leaves the plants where they were.
+const rockRand = mulberry32(SEED + 101);
+const rk = (a, b) => a + (b - a) * rockRand();
+const rockTex = canvasTexture(32, 32, (ctx, w, h) => {
+  const tones = PALETTE.rock;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    // broad light and dark blotches, then grit on top
+    const blotch = noise3(Math.cos((x / w) * TAU) * 1.3, Math.sin((x / w) * TAU) * 1.3 + Math.cos((y / h) * TAU) * 1.3, Math.sin((y / h) * TAU) * 1.3);
+    const grit = rockRand();
+    ctx.fillStyle = grit < 0.07 ? PALETTE.rockGritDark : grit > 0.94 ? PALETTE.rockGritLight : tones[THREE.MathUtils.clamp((blotch * 4 + rk(-0.5, 0.5)) | 0, 0, 3)];
+    ctx.fillRect(x, y, 1, 1);
+  }
+  ctx.fillStyle = PALETTE.rockCrack;           // a few wandering cracks
+  for (let i = 0; i < 3; i++) {
+    let x = rk(0, w) | 0, y = rk(0, h) | 0;
+    for (let k = 0; k < 14; k++) {
+      ctx.fillRect(((x % w) + w) % w, ((y % h) + h) % h, 1, 1);
+      if (rockRand() < 0.6) x += 1; if (rockRand() < 0.5) y += rockRand() < 0.5 ? 1 : -1;
+    }
+  }
+});
+const ROCK_TINTS = PALETTE.rockTints;
+// One rock: a ball pushed in and out by smooth noise (so the points two faces
+// share move together), squashed to `size`, cut flat underneath, and standing
+// with its base at `at`. `detail` 0 is a 20-sided pebble, 1 an 80-sided boulder.
+function rockGeometry(detail, size, at, tintName) {
+  const g = new THREE.IcosahedronGeometry(1, detail), p = g.attributes.position, n = p.count;
+  const o = [rk(0, 60), rk(0, 60), rk(0, 60)], turn = rk(0, TAU), cosT = Math.cos(turn), sinT = Math.sin(turn);
+  const BASE = 0.45;                           // how far below its middle the rock is cut off
+  for (let i = 0; i < n; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const lump = 1 + 0.6 * (noise3(x * 1.5 + o[0], y * 1.5 + o[1], z * 1.5 + o[2]) - 0.5)
+                   + 0.3 * (noise3(x * 3.4 + o[1], y * 3.4 + o[2], z * 3.4 + o[0]) - 0.5);
+    const px = x * lump * size.x, pz = z * lump * size.z;
+    p.setXYZ(i, at.x + px * cosT - pz * sinT, at.y + (Math.max(y * lump, -BASE) + BASE) * size.y, at.z + px * sinT + pz * cosT);
+  }
+  g.computeVertexNormals();                    // the faces share no points, so this gives each face its own normal
+  // the texture is laid on each face from whichever side it faces most squarely,
+  // one texel a tenth of a unit as on the grass; and each rock is darker at its foot
+  const uv = g.attributes.uv, normal = g.attributes.normal, colour = new Float32Array(n * 3);
+  const tint = new THREE.Color(tintName), shift = [rk(0, 1), rk(0, 1)];
+  for (let i = 0; i < n; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i), f = i - (i % 3);   // normal of the face this point belongs to
+    const ax = Math.abs(normal.getX(f)), ay = Math.abs(normal.getY(f)), az = Math.abs(normal.getZ(f));
+    const [u, v] = ay >= ax && ay >= az ? [x, z] : ax >= az ? [z, y] : [x, y];
+    uv.setXY(i, u / 3.2 + shift[0], v / 3.2 + shift[1]);
+    const shade = 0.68 + 0.32 * THREE.MathUtils.smoothstep(y - at.y, 0, 0.55 * size.y);
+    colour.set([tint.r * shade, tint.g * shade, tint.b * shade], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(colour, 3));
+  // then round the shading off, as the PS2 did (Gouraud shading): every point
+  // takes the average of the faces that meet there, so light runs smoothly over
+  // the rock and the facets show only in its outline
+  const sums = new Map(), keyOf = (i) => `${p.getX(i).toFixed(3)},${p.getY(i).toFixed(3)},${p.getZ(i).toFixed(3)}`;
+  for (let i = 0; i < n; i++) {
+    const k = keyOf(i), sum = sums.get(k) || sums.set(k, new THREE.Vector3()).get(k);
+    sum.x += normal.getX(i); sum.y += normal.getY(i); sum.z += normal.getZ(i);
+  }
+  for (let i = 0; i < n; i++) { const m = sums.get(keyOf(i)).clone().normalize(); normal.setXYZ(i, m.x, m.y, m.z); }
+  return g;
+}
+const boulders = [];                           // footprints { x, z, r }, so the bank grass can keep clear
+{
+  const parts = [], REED_GAPS = [2.5, -0.62], TREE_ANGLE = 3.85;
+  const apart = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+  // a boulder `out` units outside the rim at angle `a`, its base at height `y`
+  const boulder = (a, out, r, y, squat = 1) => {
+    const edge = rim(a), away = edge.clone().normalize(), x = edge.x + away.x * out, z = edge.y + away.y * out;
+    const size = new THREE.Vector3(r * rk(0.95, 1.35), r * rk(0.6, 0.95) * squat, r * rk(0.75, 1.0));
+    parts.push(rockGeometry(1, size, new THREE.Vector3(x, y, z), ROCK_TINTS[(rockRand() * ROCK_TINTS.length) | 0]));
+    boulders.push({ x, z, r });
+  };
+  // the ring: sizes mostly middling with the odd big one, each set so that it
+  // overhangs the water a little and hides the edge; sunk slightly so the part
+  // over the water stands in it. Gaps are left for the reeds, and now and then
+  // for grass; rocks on the near bank are kept low so they do not hide the water.
+  for (let a = 0; a < TAU;) {
+    const span = rim(a).length();
+    if (REED_GAPS.some((g) => apart(a, g) < 0.17)) { a += 0.05; continue; }
+    let r = 0.55 + 1.0 * rockRand() ** 1.8;
+    if (apart(a, TREE_ANGLE) < 0.2) r = Math.min(r, 0.75);       // room for the trunk
+    const near = Math.sin(a) > 0.4;
+    boulder(a, r * rk(0.3, 0.65), r, -0.25, near ? 0.7 : 1);
+    a += (r * rk(1.5, 2.0) + (rockRand() < 0.18 ? rk(0.8, 1.6) : 0)) / span;
+  }
+  // the heap on the far bank: a second row behind the ring, and a few perched on top
+  for (let a = 4.4; a < 5.3; a += rk(0.13, 0.19)) boulder(a, rk(1.7, 2.5), rk(0.95, 1.5), -0.1);
+  for (let a = 4.55; a < 5.15; a += rk(0.17, 0.25)) boulder(a, rk(1.3, 2.2), rk(0.7, 1.0), rk(0.75, 1.05));
+  // pebbles: small pale stones lying in drifts between and behind the boulders
+  for (let drift = 0; drift < 20; drift++) {
+    const a = rk(0, TAU), out = rk(0.2, 1.9);
+    for (let i = 0; i < 9; i++) {
+      const edge = rim(a + rk(-0.07, 0.07)), away = edge.clone().normalize(), d = out + rk(-0.6, 0.6);
+      const x = edge.x + away.x * d, z = edge.y + away.y * d, r = rk(0.1, 0.24);
+      if (d < 0.1 || boulders.some((b) => Math.hypot(b.x - x, b.z - z) < b.r * 0.8)) continue;
+      parts.push(rockGeometry(0, new THREE.Vector3(r * rk(1, 1.4), r * 0.8, r), new THREE.Vector3(x, -0.03, z), PALETTE.pebbleTints[rockRand() < 0.7 ? 0 : 1]));
+    }
+  }
+  const geometry = mergeGeometries(parts);
+  parts.forEach((g) => g.dispose());
+  scene.add(new THREE.Mesh(geometry, psx(new THREE.MeshLambertMaterial({ map: rockTex, vertexColors: true }))));
+}
+
+// -------------------------------------------------------------- bank grass
+// tufts all round the rim, thick in the four corners; each is two crossed cards.
+// None grow where a boulder sits, so they come up between the rocks instead.
+const tuftTex = canvasTexture(16, 16, (ctx) => {
+  const blades = PALETTE.tuftBlades;
+  for (let i = 0; i < 16; i++) {
+    let x = 1 + ((rand() * 14) | 0);
+    const top = (rand() * 9) | 0, lean = rand() < 0.5 ? -1 : 1;
+    ctx.fillStyle = pick(blades);
+    for (let y = 15; y >= top; y--) {
+      ctx.fillRect(Math.min(15, Math.max(0, x)), y, y > 9 ? 2 : 1, 1);
+      if ((15 - y) % 4 === 3) x += lean;
+    }
+  }
+}, { cutout: true });
+tuftTex.wrapS = tuftTex.wrapT = THREE.ClampToEdgeWrapping;
+{
+  const spots = [];
+  for (let i = 0; i < 170; i++) spots.push([rr(0, TAU), 1.03 + 0.28 * rand() ** 2, rr(0.45, 0.85)]);
+  for (const corner of [0.72, 2.45, 3.85, 5.6]) {
+    for (let i = 0; i < 55; i++) spots.push([corner + rr(-0.36, 0.36), 1.03 + 0.5 * rand(), rr(0.7, 1.35)]);
+  }
+  const clear = spots.filter(([a, k]) => { const at = rim(a, k); return !boulders.some((b) => Math.hypot(b.x - at.x, b.z - at.y) < b.r * 0.85); });
+  spots.length = 0; spots.push(...clear);
+  const card = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
+  const tufts = new THREE.InstancedMesh(
+    mergeGeometries([card, card.clone().rotateY(Math.PI / 2)]),
+    psx(new THREE.MeshBasicMaterial({ map: tuftTex, alphaTest: 0.5, side: THREE.DoubleSide }), 0.7, [0, 1.3, 0]),
+    spots.length);
+  const dummy = new THREE.Object3D(), tint = new THREE.Color();
+  spots.forEach(([a, k, size], i) => {
+    const at = rim(a, k);
+    dummy.position.set(at.x, 0, at.y);
+    dummy.rotation.y = rr(0, TAU);
+    dummy.scale.set(size * 1.15, size, size * 1.15);
+    dummy.updateMatrix();
+    tufts.setMatrixAt(i, dummy.matrix);
+    tufts.setColorAt(i, tint.set(pick(PALETTE.tuftTints)));
+  });
+  tufts.frustumCulled = false;
+  scene.add(tufts);
+}
+
+// ------------------------------------------------------------- cherry tree
+// stands on the far left bank, its boughs out over the water, where the ASCII
+// pond had a blossoming branch reaching in; its petals fall onto the surface
+const TREE_AT = rim(3.85, 1.2);
+const tree = build('cherry-tree', new THREE.Vector3(TREE_AT.x, 0, TREE_AT.y));
+
+// ------------------------------------------------------ camera + controls
+// The camera always looks from the same angle: from the near bank, down across
+// the water. The default view stands far enough back to take in the whole pond
+// and cannot be moved. Scrolling zooms in toward the pointer, and once zoomed in,
+// dragging slides the view over the pond; the closer in, the further it can go.
+// Zooming back out, or R, returns to the default view.
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enableRotate = false;
+controls.screenSpacePanning = false;           // dragging slides along the ground
+controls.zoomToCursor = true;
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
+controls.minDistance = 7;
+const HOME = new THREE.Vector3(0, 0, 0.5), VIEW_PITCH = 0.78;    // where the default view looks, and from how high (radians)
+let homeDistance = 1;                          // how far back the default view stands; depends on the window's shape
+function frameView() {
+  const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  homeDistance = Math.max(11.5 / tanV, 17 / (tanV * camera.aspect));
+  controls.maxDistance = homeDistance;
+}
+function resetView() {
+  frameView();
+  controls.target.copy(HOME);
+  camera.position.set(HOME.x, homeDistance * Math.sin(VIEW_PITCH), HOME.z + homeDistance * Math.cos(VIEW_PITCH));
+  controls.update();
+}
+// keeps the point looked at within reach of the pond: no reach at all in the
+// default view, growing to the whole pond as the camera closes in
+function holdView() {
+  const free = THREE.MathUtils.clamp(1.6 * (1 - camera.position.distanceTo(controls.target) / homeDistance), 0, 1);
+  const x = THREE.MathUtils.clamp(controls.target.x, HOME.x - POND_X * free, HOME.x + POND_X * free);
+  const z = THREE.MathUtils.clamp(controls.target.z, HOME.z - POND_Z * free, HOME.z + POND_Z * free);
+  camera.position.x += x - controls.target.x;  // the camera moves with it, so the angle is unchanged
+  camera.position.z += z - controls.target.z;
+  controls.target.x = x; controls.target.z = z;
+}
+
+// ------------------------------------------------- low-res target + screen
+// The scene is drawn into a small image, then one full-window pass puts it on
+// screen: either stretched smoothly, which is the soft picture a PS2 gave over a
+// good cable, or through the CRT filter.
+const sceneRT = new THREE.WebGLRenderTarget(1, 1, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+});
+const screenMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    tScene: { value: sceneRT.texture },
+    uRes: { value: new THREE.Vector2(1, 1) },   // size of the small image
+    uCrt: { value: 1 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene;
+    uniform vec2 uRes;
+    uniform float uCrt;
+    varying vec2 vUv;
+
+    // bulge the picture like curved glass
+    vec2 curve(vec2 uv) {
+      uv = uv * 2.0 - 1.0;
+      vec2 off = abs(uv.yx) / vec2(5.5, 4.5);
+      uv += uv * off * off;
+      uv /= 1.0 + 1.0 / (vec2(5.5, 4.5) * vec2(5.5, 4.5)); // zoom in so the bulged picture still fills the window
+      return uv * 0.5 + 0.5;
+    }
+    // one scanline of the small image, smeared sideways as a tube would
+    vec3 row(vec2 px) {
+      float x = px.x - 0.5, y = floor(px.y) + 0.5;
+      vec3 a = texture2D(tScene, vec2(floor(x) + 0.5, y) / uRes).rgb;
+      vec3 b = texture2D(tScene, vec2(floor(x) + 1.5, y) / uRes).rgb;
+      return mix(a, b, fract(x));
+    }
+    void main() {
+      vec3 col;
+      if (uCrt < 0.5) {
+        col = texture2D(tScene, vUv).rgb;                // stretched smoothly over the window
+      } else {
+        vec2 uv = curve(vUv);
+        vec2 px = uv * uRes;
+        // colour fringing: red and blue land slightly apart
+        col = vec3(row(px + vec2(0.45, 0.0)).r, row(px).g, row(px - vec2(0.45, 0.0)).b);
+        // scanlines: bright in the middle of each row, dark between rows. With 448
+        // rows a row is only two or three screen pixels tall in most windows, too
+        // few to draw a dark gap without moire, so the lines fade out to their
+        // average brightness as the rows get that thin
+        float rowPx = 1.0 / fwidth(px.y);
+        float scan = mix(0.55, 1.18, pow(sin(fract(px.y) * 3.14159), 1.4));
+        col *= mix(0.95, scan, smoothstep(2.0, 4.0, rowPx));
+        // phosphor stripes
+        float stripe = mod(floor(gl_FragCoord.x), 3.0);
+        col *= vec3(stripe == 0.0 ? 1.1 : 0.94, stripe == 1.0 ? 1.1 : 0.94, stripe == 2.0 ? 1.1 : 0.94);
+        // gently darker corners
+        float v = uv.x * (1.0 - uv.x) * uv.y * (1.0 - uv.y) * 16.0;
+        col *= mix(0.74, 1.08, pow(clamp(v, 0.0, 1.0), 0.3));
+      }
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const screenScene = new THREE.Scene();
+const screenQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), screenMaterial);
+screenQuad.frustumCulled = false;
+screenScene.add(screenQuad);
+const screenCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// CRT toggle: the button, the C key, or ?crt=off in the URL; the choice is remembered
+const crtButton = document.getElementById('crt');
+function setCrt(on) {
+  screenMaterial.uniforms.uCrt.value = on ? 1 : 0;
+  crtButton.textContent = on ? 'CRT: on' : 'CRT: off';
+  crtButton.setAttribute('aria-pressed', String(on));
+  remember('cherry-crt', on ? 'on' : 'off');
+}
+setCrt((params.get('crt') || recall('cherry-crt')) !== 'off');
+const crtIsOn = () => screenMaterial.uniforms.uCrt.value > 0.5;
+crtButton.addEventListener('click', () => setCrt(!crtIsOn()));
+
+function resize() {
+  const aspect = innerWidth / innerHeight;
+  // RENDER_WIDTH columns span a 4:3 picture; a window of another shape keeps
+  // the same pixel width and simply shows more or fewer of them
+  const h = RENDER_HEIGHT, w = Math.round(RENDER_WIDTH * aspect / (4 / 3));
+  sceneRT.setSize(w, h);
+  screenMaterial.uniforms.uRes.value.set(w, h);
+  shared.uSnap.value.set(w / 2 * SUBPIXEL, h / 2 * SUBPIXEL);
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
+  // a window of a new shape needs a new default distance; stay in the default view if that is where we were
+  const wasHome = camera.position.distanceTo(controls.target) > homeDistance * 0.999;
+  frameView();
+  if (wasHome) resetView();
+}
+resize();
+addEventListener('resize', resize);
+
+resetView();
+if (hint.className !== 'error') setTimeout(() => { hint.style.opacity = 0; }, 6000);
+
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === 'c') setCrt(!crtIsOn());
+  if (key === 'r') resetView();
+});
+
+// ------------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let time = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05) * MOTION;
+  time += dt;
+  shared.uTime.value = time;
+  updateKoi(dt);
+  updatePads(time);
+  tree?.update?.(dt, time);
+  caustics[0].offset.set(time * 0.014, time * 0.008);
+  caustics[1].offset.set(-time * 0.009, time * 0.012);
+  caustics[2].offset.set(time * 0.006, -time * 0.01);
+  controls.update();
+  holdView();
+  sky.position.copy(camera.position);
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(screenScene, screenCamera);
+});
+</script>
+</body>
+</html>
